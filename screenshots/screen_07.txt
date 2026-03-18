@@ -1,0 +1,20 @@
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ ⚡ New Job    ✓ Config  →  ✓ Source  →  ✓ Destination  →  ④ Streams          │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+  Select Streams  (8/12 selected)
+  ──────────────────────────────────────────────────────────────────────
+  [x] public.users                    CDC          cursor: updated_at
+  [x] public.orders                   CDC          cursor: id
+  [x] public.products                 Full Refresh
+  [x] public.payments                 Incremental  cursor: created_at
+  [ ] public.sessions                 —
+  [x] public.invoices                 CDC          cursor: updated_at
+  [ ] public.temp_data                —
+  [x] public.customers                CDC          cursor: modified
+  [ ] analytics.events                —
+  [x] analytics.pageviews             Full Refresh
+  [ ] analytics.raw_logs              —
+  [x] analytics.conversions           Incremental  cursor: timestamp
+
+ Space:toggle | a:all | Enter:config stream | /:search | Ctrl+Enter:create job | Esc:back

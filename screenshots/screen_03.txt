@@ -1,0 +1,13 @@
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ ⚡ OLake TUI   1 Dashboard  │  2 Sources  │  3 Destinations  │  4 Jobs  │  5 │
+│Settings                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+  NAME                 TYPE           STATUS     CREATED             
+  ──────────────────────────────────────────────────────────────────────
+  prod-postgres        PostgreSQL     ●  Active  2024-03-15 09:30    
+  staging-mysql        MySQL          ●  Active  2024-03-14 14:22    
+  analytics-mongo      MongoDB        ●  Warn    2024-03-10 11:00    
+
+
+ a:add | e:edit | d:delete | t:test | r:refresh | Tab:next

@@ -1,0 +1,12 @@
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ ⚡ OLake TUI   1 Dashboard  │  2 Sources  │  3 Destinations  │  4 Jobs  │  5 │
+│Settings                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+  NAME                 TYPE           STATUS     CREATED             
+  ──────────────────────────────────────────────────────────────────────
+  lakehouse-iceberg    Iceberg        ●  Active  2024-03-15 10:00    
+  archive-parquet      Parquet        ●  Active  2024-03-12 08:15    
+
+
+ a:add | e:edit | d:delete | t:test | r:refresh | Tab:next

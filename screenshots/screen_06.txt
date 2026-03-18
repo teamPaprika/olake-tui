@@ -1,0 +1,19 @@
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ ⚡ New Job    ① Config  →  ② Source  →  ③ Destination  →  ④ Streams          │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+  Job Name:
+  ┌──────────────────────────────────────────────────┐
+│  pg-to-iceberg-daily█                            │
+└──────────────────────────────────────────────────┘
+
+  Select Source:
+  → prod-postgres (PostgreSQL)
+    staging-mysql (MySQL)
+    analytics-mongo (MongoDB)
+
+  Select Destination:
+    lakehouse-iceberg (Iceberg)
+    archive-parquet (Parquet)
+
+ Tab:next step | j/k:navigate | Enter:select | Esc:cancel

@@ -30,11 +30,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	_ "github.com/lib/pq"
+	"go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"golang.org/x/crypto/bcrypt"
@@ -44,7 +47,59 @@ const (
 	DefaultProjectID    = "123"
 	DefaultTemporalHost = "localhost:7233"
 	DefaultRunMode      = "dev"
+
+	// Temporal task queue used by the olake worker.
+	TemporalTaskQueue = "OLAKE_DOCKER_TASK_QUEUE"
+
+	// Temporal workflow type names (must match worker registration).
+	WorkflowTypeExecute = "ExecuteWorkflow"
+	WorkflowTypeRunSync = "RunSyncWorkflow"
+
+	// DefaultConfigDir is the shared volume path between BFF/TUI and the Temporal worker.
+	DefaultConfigDir = "/tmp/olake-config"
+
+	// Timeout constants for Temporal workflows.
+	discoverTimeout       = 10 * time.Minute
+	checkTimeout          = 10 * time.Minute
+	syncTimeout           = 30 * 24 * time.Hour
+	clearDestTimeout      = 30 * 24 * time.Hour
+	cancelSyncWaitTimeout = 30 * time.Second
 )
+
+// ─── Temporal execution request (mirrors BFF's ExecutionRequest) ─────────────
+
+// temporalCommand is the CLI command dispatched to the worker.
+type temporalCommand string
+
+const (
+	cmdDiscover         temporalCommand = "discover"
+	cmdCheck            temporalCommand = "check"
+	cmdSync             temporalCommand = "sync"
+	cmdClearDestination temporalCommand = "clear-destination"
+)
+
+// jobConfig is a named file that the worker should write to the shared volume.
+type jobConfig struct {
+	Name string `json:"name"`
+	Data string `json:"data"`
+}
+
+// executionRequest is the payload sent to the Temporal worker for all
+// one-shot (non-scheduled) workflow executions.  Field names must match
+// the worker's own ExecutionRequest struct.
+type executionRequest struct {
+	Command       temporalCommand `json:"command"`
+	ConnectorType string          `json:"connector_type"`
+	Version       string          `json:"version"`
+	Args          []string        `json:"args"`
+	Configs       []jobConfig     `json:"configs"`
+	WorkflowID    string          `json:"workflow_id"`
+	ProjectID     string          `json:"project_id"`
+	JobID         int             `json:"job_id"`
+	Timeout       time.Duration   `json:"timeout"`
+	OutputFile    string          `json:"output_file"`
+	TempPath      string          `json:"temp_path,omitempty"`
+}
 
 // ─── Domain types (kept identical to the HTTP version) ─────────────────────
 
@@ -916,31 +971,421 @@ func (m *Manager) UpdateJobMeta(id int, name, frequency string) error {
 	return err
 }
 
-// ClearDestination triggers a clear-destination workflow for a job.
+// ─── Temporal filesystem helpers ─────────────────────────────────────────────
 //
-// The BFF uses a dedicated Temporal workflow that:
-//  1. Pauses the normal sync schedule.
-//  2. Updates the schedule to use a "clear" execution request (job_type=clear).
-//  3. Triggers the updated schedule.
-//  4. After completion, the worker restores the normal sync schedule.
-//
-// In the direct-DB mode the TUI cannot replicate this multi-step orchestration
-// without the full BFF service layer. We therefore return a clear error so the
-// user is not misled into thinking a normal sync has cleared their destination.
-// If you need clear-destination support, use the BFF API endpoint:
-//   POST /api/v1/project/{projectid}/jobs/{id}/clear-destination
-func (m *Manager) ClearDestination(id int) error {
-	return fmt.Errorf(
-		"clear-destination requires the BFF service layer and cannot be " +
-			"executed from the direct-DB mode. Use the BFF API endpoint instead: " +
-			"POST /api/v1/project/{projectid}/jobs/%d/clear-destination",
-		id,
-	)
+// These mirror the BFF's internal/services/temporal/filesystem.go.
+// Direct (one-shot) commands (discover, check) use the raw workflowID as the
+// subdirectory; async (scheduled) commands (sync, clear-destination) use a
+// SHA-256 hash of the workflowID.
+
+// temporalWorkDir returns the absolute work directory for a given command +
+// workflowID, matching the BFF's getWorkflowDirectory logic.
+func temporalWorkDir(cmd temporalCommand, workflowID string) string {
+	var subDir string
+	switch cmd {
+	case cmdSync, cmdClearDestination:
+		h := sha256.Sum256([]byte(workflowID))
+		subDir = fmt.Sprintf("%x", h)
+	default:
+		subDir = workflowID
+	}
+	return filepath.Join(DefaultConfigDir, subDir)
 }
 
-// TestSource is not implemented in the direct service layer (requires Temporal worker).
+// setupConfigFiles creates the work directory and writes named config files into it.
+func setupConfigFiles(cmd temporalCommand, workflowID string, configs []jobConfig) error {
+	workDir := temporalWorkDir(cmd, workflowID)
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		return fmt.Errorf("create config dir %s: %w", workDir, err)
+	}
+	for _, cfg := range configs {
+		p := filepath.Join(workDir, cfg.Name)
+		if err := os.WriteFile(p, []byte(cfg.Data), 0644); err != nil {
+			return fmt.Errorf("write %s: %w", cfg.Name, err)
+		}
+	}
+	return nil
+}
+
+// readJSONFile reads a JSON file and unmarshals it into a map.
+func readJSONFile(path string) (map[string]interface{}, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read file %s: %w", path, err)
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal %s: %w", path, err)
+	}
+	return result, nil
+}
+
+// extractWorkflowResponse calls run.Get() to retrieve the relative file path
+// returned by the worker, then reads and returns the JSON payload from disk.
+func extractWorkflowResponse(ctx context.Context, run client.WorkflowRun) (map[string]interface{}, error) {
+	raw := make(map[string]interface{})
+	if err := run.Get(ctx, &raw); err != nil {
+		return nil, fmt.Errorf("workflow execution failed: %w", err)
+	}
+	response, ok := raw["response"].(string)
+	if !ok || response == "" {
+		return nil, fmt.Errorf("invalid response format from worker (missing 'response' key)")
+	}
+	responsePath := filepath.Join(DefaultConfigDir, response)
+	return readJSONFile(responsePath)
+}
+
+// cleanupWorkDir removes the temporary config directory for a workflow.
+func cleanupWorkDir(cmd temporalCommand, workflowID string) {
+	_ = os.RemoveAll(temporalWorkDir(cmd, workflowID))
+}
+
+// ─── Temporal one-shot workflow executor ─────────────────────────────────────
+
+// executeWorkflow starts an ExecuteWorkflow Temporal workflow and waits for
+// the result, returning the JSON payload from the output file.
+func (m *Manager) executeWorkflow(ctx context.Context, req executionRequest) (map[string]interface{}, error) {
+	if m.temporal == nil {
+		return nil, fmt.Errorf("temporal client not connected — set TEMPORAL_ADDRESS")
+	}
+	opts := client.StartWorkflowOptions{
+		ID:        req.WorkflowID,
+		TaskQueue: TemporalTaskQueue,
+	}
+	run, err := m.temporal.ExecuteWorkflow(ctx, opts, WorkflowTypeExecute, req)
+	if err != nil {
+		return nil, fmt.Errorf("start workflow %s: %w", req.WorkflowID, err)
+	}
+	return extractWorkflowResponse(ctx, run)
+}
+
+// ─── ClearDestination ────────────────────────────────────────────────────────
+
+// ClearDestination triggers a clear-destination workflow for a job.
+//
+// Implementation mirrors the BFF's ETLService.ClearDestination:
+//  1. Fetches the job and its streams_config from the DB.
+//  2. Pauses the Temporal schedule to prevent a race with a new sync.
+//  3. Waits up to cancelSyncWaitTimeout for any running sync to finish.
+//  4. Writes the streams catalog to a temp file on the shared volume.
+//  5. Updates the Temporal schedule to run RunSyncWorkflow with a
+//     clear-destination ExecutionRequest.
+//  6. Triggers the schedule immediately (one-shot).
+//  7. On trigger failure, restores the schedule back to the normal sync request.
+func (m *Manager) ClearDestination(jobID int) error {
+	if m.temporal == nil {
+		return fmt.Errorf("temporal client not connected — set TEMPORAL_ADDRESS")
+	}
+
+	job, err := m.GetJob(jobID)
+	if err != nil {
+		return fmt.Errorf("get job: %w", err)
+	}
+	if !job.Activate {
+		return fmt.Errorf("job is paused — unpause the job before running clear-destination")
+	}
+
+	workflowID, scheduleID := m.workflowAndScheduleID(m.projectID, jobID)
+	ctx := context.Background()
+
+	// 1. Pause the schedule to prevent a new sync starting while we prepare.
+	handle := m.temporal.ScheduleClient().GetHandle(ctx, scheduleID)
+	if err := handle.Pause(ctx, client.SchedulePauseOptions{Note: "clear-destination in progress"}); err != nil {
+		return fmt.Errorf("pause schedule: %w", err)
+	}
+
+	// 2. Wait for any running sync to finish (best-effort, limited window).
+	waitCtx, cancel := context.WithTimeout(ctx, cancelSyncWaitTimeout)
+	defer cancel()
+	m.waitForSyncToStop(waitCtx, workflowID)
+
+	// 3. Build the clear-destination execution request.
+	clearReq, tempRelPath, err := m.buildClearDestRequest(job, workflowID)
+	if err != nil {
+		// Resume schedule before returning error.
+		_ = handle.Unpause(ctx, client.ScheduleUnpauseOptions{Note: "clear-destination setup failed"})
+		return fmt.Errorf("build clear-destination request: %w", err)
+	}
+
+	// 4. Update the schedule to use the clear-destination request.
+	if err := m.updateSchedule(ctx, job.Frequency, jobID, clearReq); err != nil {
+		_ = handle.Unpause(ctx, client.ScheduleUnpauseOptions{Note: "clear-destination update failed"})
+		if tempRelPath != "" {
+			_ = os.Remove(filepath.Join(DefaultConfigDir, tempRelPath))
+		}
+		return fmt.Errorf("update schedule for clear-destination: %w", err)
+	}
+
+	// 5. Trigger the schedule immediately.
+	if err := handle.Trigger(ctx, client.ScheduleTriggerOptions{
+		Overlap: enums.SCHEDULE_OVERLAP_POLICY_SKIP,
+	}); err != nil {
+		// Revert schedule back to normal sync.
+		syncReq := m.buildSyncRequest(job, workflowID)
+		_ = m.updateSchedule(ctx, job.Frequency, jobID, syncReq)
+		_ = handle.Unpause(ctx, client.ScheduleUnpauseOptions{Note: "clear-destination trigger failed, reverted"})
+		if tempRelPath != "" {
+			_ = os.Remove(filepath.Join(DefaultConfigDir, tempRelPath))
+		}
+		return fmt.Errorf("trigger clear-destination schedule: %w", err)
+	}
+
+	return nil
+}
+
+// buildSyncRequest builds the normal RunSyncWorkflow ExecutionRequest (matches BFF).
+func (m *Manager) buildSyncRequest(job *Job, workflowID string) *executionRequest {
+	return &executionRequest{
+		Command:       cmdSync,
+		ConnectorType: job.Source.Type,
+		Version:       job.Source.Version,
+		Args: []string{
+			"sync",
+			"--config", "/mnt/config/source.json",
+			"--destination", "/mnt/config/destination.json",
+			"--catalog", "/mnt/config/streams.json",
+			"--state", "/mnt/config/state.json",
+		},
+		WorkflowID: workflowID,
+		JobID:      job.ID,
+		ProjectID:  m.projectID,
+		Timeout:    syncTimeout,
+		OutputFile: "state.json",
+	}
+}
+
+// buildClearDestRequest builds the RunSyncWorkflow ExecutionRequest for a
+// clear-destination run, writing the streams catalog to the shared volume.
+// Returns the request and the relative path of the written temp file (for cleanup).
+func (m *Manager) buildClearDestRequest(job *Job, workflowID string) (*executionRequest, string, error) {
+	catalog := job.StreamsConfig
+
+	// Write the streams catalog to a unique subdirectory so the worker can read it.
+	streamsDir := fmt.Sprintf("%s-%d", workflowID, time.Now().Unix())
+	relativePath := filepath.Join(streamsDir, "streams.json")
+	streamsPath := filepath.Join(DefaultConfigDir, relativePath)
+
+	if err := os.MkdirAll(filepath.Dir(streamsPath), 0755); err != nil {
+		return nil, "", fmt.Errorf("create streams dir: %w", err)
+	}
+	if err := os.WriteFile(streamsPath, []byte(catalog), 0644); err != nil {
+		return nil, "", fmt.Errorf("write streams file: %w", err)
+	}
+
+	req := &executionRequest{
+		Command:       cmdClearDestination,
+		ConnectorType: job.Source.Type,
+		Version:       job.Source.Version,
+		Args: []string{
+			"clear-destination",
+			"--streams", "/mnt/config/streams.json",
+			"--state", "/mnt/config/state.json",
+			"--destination", "/mnt/config/destination.json",
+		},
+		WorkflowID: workflowID,
+		ProjectID:  m.projectID,
+		JobID:      job.ID,
+		Timeout:    clearDestTimeout,
+		OutputFile: "state.json",
+		TempPath:   relativePath,
+	}
+	return req, relativePath, nil
+}
+
+// updateSchedule updates a Temporal schedule's workflow action.
+func (m *Manager) updateSchedule(ctx context.Context, frequency string, jobID int, req *executionRequest) error {
+	_, scheduleID := m.workflowAndScheduleID(m.projectID, jobID)
+	handle := m.temporal.ScheduleClient().GetHandle(ctx, scheduleID)
+	return handle.Update(ctx, client.ScheduleUpdateOptions{
+		DoUpdate: func(input client.ScheduleUpdateInput) (*client.ScheduleUpdate, error) {
+			if frequency != "" {
+				input.Description.Schedule.Spec = &client.ScheduleSpec{
+					CronExpressions: []string{frequency},
+				}
+			}
+			if req != nil {
+				input.Description.Schedule.Action = &client.ScheduleWorkflowAction{
+					ID:        req.WorkflowID,
+					Workflow:  WorkflowTypeRunSync,
+					Args:      []any{*req},
+					TaskQueue: TemporalTaskQueue,
+				}
+			}
+			return &client.ScheduleUpdate{
+				Schedule: &input.Description.Schedule,
+			}, nil
+		},
+	})
+}
+
+// waitForSyncToStop polls Temporal for running sync workflows and waits until
+// they finish or the context is cancelled.
+func (m *Manager) waitForSyncToStop(ctx context.Context, workflowID string) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			q := fmt.Sprintf("WorkflowId = '%s' AND ExecutionStatus = 'Running'", workflowID)
+			resp, err := m.temporal.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{
+				Query: q,
+			})
+			if err != nil || len(resp.GetExecutions()) == 0 {
+				return
+			}
+		}
+	}
+}
+
+// ─── TestSource ──────────────────────────────────────────────────────────────
+
+// TestSource tests a source connection by triggering a Temporal check workflow.
+//
+// Mirrors BFF's ETLService.TestSourceConnection:
+//  1. Encrypts the connector config (so the worker can decrypt it).
+//  2. Writes config.json to the shared volume at /tmp/olake-config/<workflowID>/.
+//  3. Executes the ExecuteWorkflow Temporal workflow with `check --config`.
+//  4. Reads the connection result from the output file.
 func (m *Manager) TestSource(s EntityBase) (*TestConnectionResult, error) {
-	return &TestConnectionResult{}, fmt.Errorf("connection testing requires the Temporal worker; not available in direct DB mode")
+	if m.temporal == nil {
+		return nil, fmt.Errorf("temporal client not connected — set TEMPORAL_ADDRESS")
+	}
+
+	workflowID := fmt.Sprintf("test-connection-%s-%d", s.Type, time.Now().Unix())
+
+	// Encrypt config before sending to the worker (matches BFF behaviour).
+	encryptedConfig, err := m.encrypt(s.Config)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt source config: %w", err)
+	}
+
+	configs := []jobConfig{
+		{Name: "config.json", Data: encryptedConfig},
+	}
+	if err := setupConfigFiles(cmdCheck, workflowID, configs); err != nil {
+		return nil, fmt.Errorf("setup config files: %w", err)
+	}
+	defer cleanupWorkDir(cmdCheck, workflowID)
+
+	cmdArgs := []string{
+		"check",
+		"--config", "/mnt/config/config.json",
+	}
+	// Pass encryption key if configured so the worker can decrypt the config.
+	if m.encryptionKey != "" {
+		cmdArgs = append(cmdArgs, "--encryption-key", m.encryptionKey)
+	}
+
+	req := executionRequest{
+		Command:       cmdCheck,
+		ConnectorType: s.Type,
+		Version:       s.Version,
+		Args:          cmdArgs,
+		WorkflowID:    workflowID,
+		Timeout:       checkTimeout,
+		OutputFile:    "",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), checkTimeout+30*time.Second)
+	defer cancel()
+
+	result, err := m.executeWorkflow(ctx, req)
+	if err != nil {
+		return &TestConnectionResult{
+			ConnectionResult: struct {
+				Message string `json:"message"`
+				Status  string `json:"status"`
+			}{Message: err.Error(), Status: "FAILED"},
+		}, fmt.Errorf("check workflow: %w", err)
+	}
+
+	return parseConnectionResult(result), nil
+}
+
+// TestDestination tests a destination connection via Temporal.
+//
+// Mirrors BFF's ETLService.TestDestinationConnection.
+// The flag passed to `olake check` is "--destination" (not "--config").
+func (m *Manager) TestDestination(d EntityBase, sourceType, sourceVersion string) (*TestConnectionResult, error) {
+	if m.temporal == nil {
+		return nil, fmt.Errorf("temporal client not connected — set TEMPORAL_ADDRESS")
+	}
+
+	workflowID := fmt.Sprintf("test-connection-%s-%d", d.Type, time.Now().Unix())
+
+	encryptedConfig, err := m.encrypt(d.Config)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt destination config: %w", err)
+	}
+
+	configs := []jobConfig{
+		{Name: "config.json", Data: encryptedConfig},
+	}
+	if err := setupConfigFiles(cmdCheck, workflowID, configs); err != nil {
+		return nil, fmt.Errorf("setup config files: %w", err)
+	}
+	defer cleanupWorkDir(cmdCheck, workflowID)
+
+	cmdArgs := []string{
+		"check",
+		"--destination", "/mnt/config/config.json",
+	}
+	if m.encryptionKey != "" {
+		cmdArgs = append(cmdArgs, "--encryption-key", m.encryptionKey)
+	}
+
+	// Use source driver to run the check command (matches BFF).
+	connectorType := sourceType
+	if connectorType == "" {
+		connectorType = "postgres" // sensible fallback
+	}
+	version := sourceVersion
+	if version == "" {
+		version = d.Version
+	}
+
+	req := executionRequest{
+		Command:       cmdCheck,
+		ConnectorType: connectorType,
+		Version:       version,
+		Args:          cmdArgs,
+		WorkflowID:    workflowID,
+		Timeout:       checkTimeout,
+		OutputFile:    "",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), checkTimeout+30*time.Second)
+	defer cancel()
+
+	result, err := m.executeWorkflow(ctx, req)
+	if err != nil {
+		return &TestConnectionResult{
+			ConnectionResult: struct {
+				Message string `json:"message"`
+				Status  string `json:"status"`
+			}{Message: err.Error(), Status: "FAILED"},
+		}, fmt.Errorf("check workflow: %w", err)
+	}
+
+	return parseConnectionResult(result), nil
+}
+
+// parseConnectionResult extracts a TestConnectionResult from a workflow response map.
+func parseConnectionResult(result map[string]interface{}) *TestConnectionResult {
+	out := &TestConnectionResult{}
+	cs, ok := result["connectionStatus"].(map[string]interface{})
+	if !ok {
+		cs = result // some workers return flat map
+	}
+	if status, ok := cs["status"].(string); ok {
+		out.ConnectionResult.Status = status
+	}
+	if msg, ok := cs["message"].(string); ok {
+		out.ConnectionResult.Message = msg
+	}
+	return out
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -971,28 +1416,141 @@ type StreamConfig struct {
 	Selected    bool   `json:"selected"`
 }
 
-// DiscoverStreams returns the stream catalogue for a source by triggering discovery.
+// DiscoverStreams returns the stream catalogue for a source by triggering a
+// Temporal discover workflow, matching the BFF's GetSourceCatalog behaviour.
 //
-// The BFF implements discover by:
-//  1. Writing connector config to disk.
-//  2. Triggering a Temporal workflow that runs the olake CLI with the "discover" command.
-//  3. Reading the resulting catalog JSON produced by the CLI.
-//
-// The direct-DB mode cannot replicate this without a running Temporal worker and
-// the olake CLI. Reading streams_config from an existing job is INCORRECT because:
-//   - streams_config holds user-selected stream configs (not the full raw catalog).
-//   - For new sources with no jobs, there is nothing to read.
-//   - The data would be stale, missing new tables added to the source since the last sync.
-//
-// We therefore return an explicit error so callers know they must use the BFF.
+// Flow (mirrors BFF's temporal.DiscoverStreams):
+//  1. Fetches and decrypts the source config from the database.
+//  2. Re-encrypts it for the worker (the worker expects encrypted config).
+//  3. Writes config.json (and an empty streams.json) to /tmp/olake-config/<workflowID>/.
+//  4. Executes the ExecuteWorkflow Temporal workflow with `discover --config …`.
+//  5. Reads the resulting streams.json output file returned by the worker.
+//  6. Parses the catalog into []StreamInfo.
 func (m *Manager) DiscoverStreams(sourceID int) ([]StreamInfo, error) {
-	return nil, fmt.Errorf(
-		"stream discovery requires a running Temporal worker and the olake CLI. " +
-			"In direct-DB mode, discovery is not supported. " +
-			"Please use the BFF API to discover streams first, then create jobs via the TUI. " +
-			"BFF endpoint: POST /api/v1/project/{projectid}/sources/%d/catalog",
-		sourceID,
-	)
+	if m.temporal == nil {
+		return nil, fmt.Errorf("temporal client not connected — set TEMPORAL_ADDRESS")
+	}
+
+	src, err := m.GetSource(sourceID)
+	if err != nil {
+		return nil, fmt.Errorf("get source id[%d]: %w", sourceID, err)
+	}
+
+	// src.Config is already decrypted by GetSource; re-encrypt for the worker.
+	encryptedConfig, err := m.encrypt(src.Config)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt source config: %w", err)
+	}
+
+	workflowID := fmt.Sprintf("discover-catalog-%s-%d", src.Type, time.Now().Unix())
+
+	configs := []jobConfig{
+		{Name: "config.json", Data: encryptedConfig},
+		{Name: "streams.json", Data: ""},
+	}
+	if err := setupConfigFiles(cmdDiscover, workflowID, configs); err != nil {
+		return nil, fmt.Errorf("setup config files: %w", err)
+	}
+	defer cleanupWorkDir(cmdDiscover, workflowID)
+
+	cmdArgs := []string{
+		"discover",
+		"--config", "/mnt/config/config.json",
+	}
+	if m.encryptionKey != "" {
+		cmdArgs = append(cmdArgs, "--encryption-key", m.encryptionKey)
+	}
+
+	req := executionRequest{
+		Command:       cmdDiscover,
+		ConnectorType: src.Type,
+		Version:       src.Version,
+		Args:          cmdArgs,
+		WorkflowID:    workflowID,
+		Timeout:       discoverTimeout,
+		OutputFile:    "streams.json",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), discoverTimeout+30*time.Second)
+	defer cancel()
+
+	result, err := m.executeWorkflow(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("discover workflow: %w", err)
+	}
+
+	return parseStreamsFromCatalog(result), nil
+}
+
+// parseStreamsFromCatalog extracts []StreamInfo from the JSON map returned by
+// the olake discover command.  The BFF returns the raw map to the frontend;
+// the TUI needs to parse it into typed structs.
+//
+// The olake catalog JSON has this structure:
+//
+//	{
+//	  "streams": [
+//	    {
+//	      "stream": {
+//	        "name": "orders",
+//	        "namespace": "public",
+//	        "supported_sync_modes": ["full_refresh", "incremental"],
+//	        "source_defined_cursor": true,
+//	        "default_cursor_field": ["updated_at"]
+//	      },
+//	      "sync_mode": "incremental",
+//	      "cursor_field": ["updated_at"]
+//	    },
+//	    ...
+//	  ]
+//	}
+func parseStreamsFromCatalog(result map[string]interface{}) []StreamInfo {
+	streamsRaw, ok := result["streams"].([]interface{})
+	if !ok {
+		return nil
+	}
+	var out []StreamInfo
+	for _, item := range streamsRaw {
+		entry, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		streamObj, ok := entry["stream"].(map[string]interface{})
+		if !ok {
+			// Some workers return the fields directly at the top level.
+			streamObj = entry
+		}
+		var si StreamInfo
+		si.Name, _ = streamObj["name"].(string)
+		si.Namespace, _ = streamObj["namespace"].(string)
+
+		if modes, ok := streamObj["supported_sync_modes"].([]interface{}); ok {
+			for _, m := range modes {
+				if s, ok := m.(string); ok {
+					si.SyncModes = append(si.SyncModes, s)
+				}
+			}
+		}
+		if cursors, ok := streamObj["default_cursor_field"].([]interface{}); ok {
+			for _, c := range cursors {
+				if s, ok := c.(string); ok {
+					si.CursorFields = append(si.CursorFields, s)
+				}
+			}
+		}
+		if len(si.CursorFields) == 0 {
+			// Fallback: check available_cursor_fields
+			if cursors, ok := streamObj["available_cursor_fields"].([]interface{}); ok {
+				for _, c := range cursors {
+					if s, ok := c.(string); ok {
+						si.CursorFields = append(si.CursorFields, s)
+					}
+				}
+			}
+		}
+		out = append(out, si)
+	}
+	return out
 }
 
 // CreateJob inserts a new job record into the database.

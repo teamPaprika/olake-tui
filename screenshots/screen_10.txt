@@ -1,0 +1,19 @@
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ Job Settings: pg-to-iceberg                                                  │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+  Job Name:
+  ┌──────────────────────────────────────────────────┐
+│  pg-to-iceberg                                   │
+└──────────────────────────────────────────────────┘
+
+  Schedule
+  Frequency: Manual │ Every 30m │ Daily │ Weekly │ Custom
+  Next run: in 28 minutes
+
+  Status: ● Active  [p to pause]
+
+  ────────────────────────────────────────
+  [ Clear Destination ]    [ Delete Job ]
+
+     Save       Esc: cancel

@@ -1,0 +1,22 @@
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ Job: pg-to-iceberg  │  Task: abc123  │  ● Running                            │
+╰──────────────────────────────────────────────────────────────────────────────╯
+  Level: [ALL]  INFO   WARN   ERROR  │  Search: _______________
+  ────────────────────────────────────────────────────────────────────────────
+  22:30:01  INFO   Starting sync for job pg-to-iceberg...
+  22:30:01  INFO   Connecting to source: prod-postgres (PostgreSQL)
+  22:30:02  INFO   Connection established successfully
+  22:30:02  INFO   Discovering schema changes...
+  22:30:03  INFO   Found 8 streams to sync
+  22:30:03  INFO   Starting CDC replication for public.users
+  22:30:04  INFO   Processing batch: 1,024 records
+  22:30:05  WARN   Slow query detected on public.orders (>2s)
+  22:30:06  INFO   Written 1,024 records to Iceberg (public.users)
+  22:30:06  INFO   Starting CDC replication for public.orders
+  22:30:07  INFO   Processing batch: 2,048 records
+  22:30:08  INFO   Written 2,048 records to Iceberg (public.orders)
+  22:30:09  ERROR  Connection timeout on public.payments — retrying (1/3)
+  22:30:12  INFO   Reconnected to public.payments
+  22:30:13  INFO   Processing batch: 512 records
+
+ j/k:scroll | ←→:level filter | /:search | d:download | p/n:page | q:close

@@ -1,0 +1,15 @@
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ ⚡ OLake TUI   1 Dashboard  │  2 Sources  │  3 Destinations  │  4 Jobs  │  5 │
+│Settings                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+  NAME             SOURCE → DEST          STATUS     SCHEDULE     LAST SYNC     
+  ────────────────────────────────────────────────────────────────────────────
+  pg-to-iceberg    prod-pg → lakehouse    ● Running  Every 30m    2 min ago     
+  mysql-sync       staging → lakehouse    ● Done     Every 1h     28 min ago    
+  mongo-archive    analytics → parquet    ● Failed   Daily 02:00  18h ago       
+  kafka-ingest     events → lakehouse     ● Inactive Manual       3d ago        
+  s3-import        s3-bucket → parquet    ● Done     Weekly Mon   5d ago        
+
+
+ n:new | Enter:detail | S:settings | s:sync | c:cancel | l:logs | d:delete | r:refresh
