@@ -1,7 +1,10 @@
+mod confirm_dialog;
 mod dashboard;
+mod destination_form;
 mod destinations;
 mod jobs;
 mod login;
+mod source_form;
 mod sources;
 
 use ratatui::prelude::*;
@@ -11,15 +14,41 @@ use crate::app::{App, Screen, Tab};
 
 /// Main render entry point — routes to login or main tabs based on auth state.
 pub fn render(frame: &mut Frame, app: &App) {
-    match app.screen {
+    match &app.screen {
         Screen::Login => {
-            // Draw a dark background, then the login overlay.
             let bg = Block::default().style(Style::default().bg(Color::Black));
             frame.render_widget(bg, frame.area());
             login::render(frame, app);
         }
         Screen::Main => render_main(frame, app),
+        Screen::SourceForm => render_source_form(frame, app),
+        Screen::DestinationForm => render_dest_form(frame, app),
+        Screen::ConfirmDialog => {
+            // Render main underneath, then overlay the dialog
+            render_main(frame, app);
+            confirm_dialog::render(
+                frame,
+                &app.confirm_dialog.title,
+                &app.confirm_dialog.message,
+                app.confirm_dialog.yes_selected,
+            );
+        }
     }
+}
+
+/// Render the source form screen.
+fn render_source_form(frame: &mut Frame, app: &App) {
+    // Draw dark background
+    let bg = Block::default().style(Style::default().bg(Color::Black));
+    frame.render_widget(bg, frame.area());
+    source_form::render(frame, frame.area(), app);
+}
+
+/// Render the destination form screen.
+fn render_dest_form(frame: &mut Frame, app: &App) {
+    let bg = Block::default().style(Style::default().bg(Color::Black));
+    frame.render_widget(bg, frame.area());
+    destination_form::render(frame, frame.area(), app);
 }
 
 /// Render the main tabbed interface.
@@ -97,7 +126,7 @@ fn render_main(frame: &mut Frame, app: &App) {
         ])
     } else {
         Line::from(Span::styled(
-            " Tab/1-4: navigate | q: quit",
+            " Tab/1-4: navigate | a: add | e: edit | d: delete | t: test | q: quit",
             Style::default().fg(Color::DarkGray),
         ))
     };
