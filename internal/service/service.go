@@ -269,6 +269,14 @@ func New(cfg Config) (*Manager, error) {
 		cfg.TemporalHost = DefaultTemporalHost
 	}
 
+	// Validate runMode to prevent SQL injection via table names.
+	switch cfg.RunMode {
+	case "dev", "prod", "staging":
+		// ok
+	default:
+		return nil, fmt.Errorf("invalid run mode %q: must be dev, prod, or staging", cfg.RunMode)
+	}
+
 	if cfg.DBURL == "" {
 		return nil, fmt.Errorf("OLAKE_DB_URL is required (PostgreSQL connection string)")
 	}
@@ -573,15 +581,13 @@ func (m *Manager) DeleteSource(id int) error {
 		return fmt.Errorf("source is used by %d job(s); delete those jobs first", count)
 	}
 	q := fmt.Sprintf(`UPDATE %s SET deleted_at=NOW(), updated_at=NOW(), updated_by_id=$2 WHERE id=$1 AND deleted_at IS NULL`, m.tbl("source"))
-	m.authMu.RLock()
 	uid := m.currentUserID()
-	m.authMu.RUnlock()
 	_, err = m.db.ExecContext(context.Background(), q, id, uid)
 	return err
 }
 
 func (m *Manager) countJobsBySource(sourceID int) (int, error) {
-	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE source_id=$1`, m.tbl("job"))
+	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE source_id=$1 AND deleted_at IS NULL`, m.tbl("job"))
 	var n int
 	err := m.db.QueryRowContext(context.Background(), q, sourceID).Scan(&n)
 	return n, err
@@ -710,7 +716,7 @@ func (m *Manager) DeleteDestination(id int) error {
 }
 
 func (m *Manager) countJobsByDest(destID int) (int, error) {
-	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE dest_id=$1`, m.tbl("job"))
+	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE dest_id=$1 AND deleted_at IS NULL`, m.tbl("job"))
 	var n int
 	err := m.db.QueryRowContext(context.Background(), q, destID).Scan(&n)
 	return n, err
@@ -731,7 +737,7 @@ func (m *Manager) ListJobs() ([]Job, error) {
 		LEFT JOIN %s d ON j.dest_id = d.id
 		LEFT JOIN %s cu ON j.created_by_id = cu.id
 		LEFT JOIN %s uu ON j.updated_by_id = uu.id
-		WHERE j.project_id = $1
+		WHERE j.project_id = $1 AND j.deleted_at IS NULL
 		ORDER BY j.updated_at DESC`,
 		m.tbl("job"), m.tbl("source"), m.tbl("destination"), m.tbl("user"), m.tbl("user"))
 
@@ -846,7 +852,7 @@ func (m *Manager) DeleteJob(id int) error {
 	}
 
 	// Soft-delete the job record to match BFF behavior (sets deleted_at = NOW()).
-	q := fmt.Sprintf(`UPDATE %s SET deleted_at=NOW(), updated_at=NOW(), updated_by_id=$2 WHERE id=$1`, m.tbl("job"))
+	q := fmt.Sprintf(`UPDATE %s SET deleted_at=NOW(), updated_at=NOW(), updated_by_id=$2 WHERE id=$1 AND deleted_at IS NULL`, m.tbl("job"))
 	m.authMu.RLock()
 	uid := m.currentUserID()
 	m.authMu.RUnlock()
@@ -1583,5 +1589,69 @@ func (m *Manager) CreateJob(name string, sourceID, destID int, frequency string,
 	if err != nil {
 		return nil, fmt.Errorf("create job: %w", err)
 	}
+
+	// Create Temporal schedule so the job actually runs on its cron frequency.
+	// Best-effort: if Temporal is not connected the job exists in DB but won't
+	// auto-sync until manually triggered or Temporal reconnects.
+	if m.temporal != nil {
+		job, err := m.GetJob(jobID)
+		if err != nil {
+			return nil, fmt.Errorf("get created job for schedule: %w", err)
+		}
+
+		src, srcErr := m.GetSource(job.Source.ID)
+		dst, dstErr := m.GetDestination(job.Destination.ID)
+		if srcErr == nil && dstErr == nil {
+			workflowID, scheduleID := m.workflowAndScheduleID(m.projectID, jobID)
+
+			encSrcCfg, _ := m.encrypt(src.Config)
+			encDstCfg, _ := m.encrypt(dst.Config)
+
+			configs := []jobConfig{
+				{Name: "source.json", Data: encSrcCfg},
+				{Name: "destination.json", Data: encDstCfg},
+				{Name: "streams.json", Data: string(streamsJSON)},
+				{Name: "state.json", Data: "{}"},
+			}
+			_ = setupConfigFiles(cmdSync, workflowID, configs)
+
+			syncReq := executionRequest{
+				Command:       cmdSync,
+				ConnectorType: job.Source.Type,
+				Version:       job.Source.Version,
+				Args: []string{
+					"sync",
+					"--config", "/mnt/config/source.json",
+					"--destination", "/mnt/config/destination.json",
+					"--catalog", "/mnt/config/streams.json",
+					"--state", "/mnt/config/state.json",
+				},
+				WorkflowID: workflowID,
+				JobID:      jobID,
+				ProjectID:  m.projectID,
+				Timeout:    syncTimeout,
+				OutputFile: "state.json",
+			}
+			if m.encryptionKey != "" {
+				syncReq.Args = append(syncReq.Args, "--encryption-key", m.encryptionKey)
+			}
+
+			_, _ = m.temporal.ScheduleClient().Create(context.Background(), client.ScheduleOptions{
+				ID: scheduleID,
+				Spec: client.ScheduleSpec{
+					CronExpressions: []string{frequency},
+				},
+				Action: &client.ScheduleWorkflowAction{
+					ID:        workflowID,
+					Workflow:  WorkflowTypeRunSync,
+					Args:      []any{syncReq},
+					TaskQueue: TemporalTaskQueue,
+				},
+			})
+		}
+
+		return job, nil
+	}
+
 	return m.GetJob(jobID)
 }

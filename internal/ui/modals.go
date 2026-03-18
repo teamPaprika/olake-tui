@@ -546,7 +546,11 @@ func (m *DeleteModal) NeedsSpinner() bool                    { return false }
 
 func (m *DeleteModal) View() string {
 	icon := StyleError.Bold(true).Render("⚠")
-	title := StyleError.Bold(true).Render(fmt.Sprintf("Delete %s", strings.Title(m.entityKind)))
+	kind := m.entityKind
+	if len(kind) > 0 {
+		kind = strings.ToUpper(kind[:1]) + kind[1:]
+	}
+	title := StyleError.Bold(true).Render(fmt.Sprintf("Delete %s", kind))
 	body := StyleNormal.Render(fmt.Sprintf(
 		"Deleting '%s' will disable all associated jobs. Are you sure?", m.entityName))
 
