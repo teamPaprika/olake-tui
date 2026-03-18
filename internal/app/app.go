@@ -26,6 +26,7 @@ const (
 	ScreenJobDetail
 	ScreenJobSettings
 	ScreenSystemSettings
+	ScreenJobWizard
 )
 
 // Tab identifiers (for main navigation).
@@ -76,6 +77,14 @@ type msgSettingsLoaded struct {
 	err      error
 }
 type msgSettingsSaved struct{ err error }
+type msgDiscoverDone struct {
+	streams []service.StreamInfo
+	err     error
+}
+type msgJobCreatedWizard struct {
+	job *service.Job
+	err error
+}
 
 // confirmContext identifies what action a confirmation dialog is for.
 type confirmContext int
@@ -116,6 +125,9 @@ type Model struct {
 
 	// System settings sub-model
 	sysSettings  *ui.SettingsModel
+
+	// Job creation wizard
+	wizard       *ui.JobWizardModel
 
 	// Data
 	jobList   []service.Job
@@ -188,6 +200,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.sysSettings != nil {
 			m.sysSettings.SetSize(m.width, m.height)
+		}
+		if m.wizard != nil {
+			m.wizard.SetSize(m.width, m.height)
 		}
 
 	// ---------- Toast expiry ----------
@@ -460,6 +475,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sysSettings = nil
 		return m, nil
 
+	// ---------- Wizard messages ----------
+	case ui.WizardMsg:
+		return m.handleWizardMsg(msg)
+
+	case msgDiscoverDone:
+		if m.wizard != nil {
+			wzd, cmd := m.wizard.Update(ui.WizardStreamsLoaded{Streams: msg.streams, Err: msg.err})
+			m.wizard = &wzd
+			return m, cmd
+		}
+
+	case msgJobCreatedWizard:
+		m.wizard = nil
+		m.screen = ScreenJobs
+		if msg.err != nil {
+			m.toast = "Create job failed: " + msg.err.Error()
+			m.toastError = true
+		} else {
+			m.toast = "Job created!"
+			m.toastError = false
+			m.jobs.SetLoading(true)
+			cmds = append(cmds, m.loadJobs())
+		}
+		cmds = append(cmds, showToast(m.toast, m.toastError))
+
 	// ---------- Key events ----------
 	case tea.KeyMsg:
 		return m.handleKey(msg, cmds)
@@ -565,6 +605,13 @@ func (m Model) handleKey(msg tea.KeyMsg, cmds []tea.Cmd) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	// Wizard screen
+	if m.screen == ScreenJobWizard && m.wizard != nil {
+		wzd, cmd := m.wizard.Update(msg)
+		m.wizard = &wzd
+		return m, cmd
+	}
+
 	// Tab switching
 	switch msg.String() {
 	case "1":
@@ -627,6 +674,8 @@ func (m Model) handleTabKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if j := m.jobs.SelectedJob(); j != nil {
 				return m.openJobSettings(*j)
 			}
+		case "n":
+			return m.openJobWizard()
 		default:
 			var cmd tea.Cmd
 			m.jobs, cmd = m.jobs.Update(msg)
@@ -715,6 +764,58 @@ func (m *Model) handleConfirmResult(yes bool) tea.Cmd {
 		}
 	}
 	return nil
+}
+
+// openJobWizard starts the job creation wizard.
+func (m Model) openJobWizard() (Model, tea.Cmd) {
+	wzd := ui.NewJobWizardModel(m.srcList, m.dstList, m.width, m.height)
+	m.wizard = &wzd
+	m.screen = ScreenJobWizard
+	// Ensure we have sources and dests loaded
+	var cmds []tea.Cmd
+	if len(m.srcList) == 0 {
+		cmds = append(cmds, m.loadSources())
+	}
+	if len(m.dstList) == 0 {
+		cmds = append(cmds, m.loadDests())
+	}
+	cmds = append(cmds, wzd.Init())
+	return m, tea.Batch(cmds...)
+}
+
+// handleWizardMsg processes messages emitted by the wizard.
+func (m Model) handleWizardMsg(msg ui.WizardMsg) (tea.Model, tea.Cmd) {
+	switch msg.Action {
+	case ui.WizardActionCancel:
+		m.wizard = nil
+		m.screen = ScreenJobs
+		return m, nil
+
+	case ui.WizardActionDiscover:
+		srcID := msg.SourceID
+		svc := m.svc
+		return m, func() tea.Msg {
+			streams, err := svc.DiscoverStreams(srcID)
+			return msgDiscoverDone{streams: streams, err: err}
+		}
+
+	case ui.WizardActionDone:
+		if m.wizard == nil {
+			m.screen = ScreenJobs
+			return m, nil
+		}
+		// Collect data from wizard
+		jobName := m.wizard.JobName()
+		srcID := m.wizard.SelectedSourceID()
+		dstID := m.wizard.SelectedDestID()
+		configs := m.wizard.SelectedStreamConfigs()
+		svc := m.svc
+		return m, func() tea.Msg {
+			job, err := svc.CreateJob(jobName, srcID, dstID, "", configs)
+			return msgJobCreatedWizard{job: job, err: err}
+		}
+	}
+	return m, nil
 }
 
 // showConfirm transitions to the confirmation dialog.
@@ -868,6 +969,12 @@ func (m Model) delegateUpdate(msg tea.Msg) tea.Cmd {
 			m.sysSettings = &ss
 			cmd = c
 		}
+	case ScreenJobWizard:
+		if m.wizard != nil {
+			wzd, c := m.wizard.Update(msg)
+			m.wizard = &wzd
+			cmd = c
+		}
 	}
 	return cmd
 }
@@ -923,6 +1030,10 @@ func (m Model) View() string {
 		header := m.renderHeader()
 		status := m.renderStatusBar()
 		return lipgloss.JoinVertical(lipgloss.Left, header, m.sysSettings.View(), status)
+	}
+
+	if m.screen == ScreenJobWizard && m.wizard != nil {
+		return m.wizard.View()
 	}
 
 	// Compute available height for content (subtract header + status bar)
@@ -1021,7 +1132,7 @@ func (m Model) renderStatusBar() string {
 	var hint string
 	switch m.screen {
 	case ScreenJobs:
-		hint = "1-5:tabs  Enter:detail  S:settings  s:sync  c:cancel  l:logs  p:pause  d:delete  r:refresh  q:quit"
+		hint = "1-5:tabs  n:new  Enter:detail  S:settings  s:sync  c:cancel  l:logs  p:pause  d:delete  r:refresh  q:quit"
 	case ScreenJobDetail:
 		hint = "↑↓/j/k:navigate  enter/l:logs  s:sync  c:cancel  esc:back"
 	case ScreenJobSettings:
