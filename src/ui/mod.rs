@@ -2,6 +2,7 @@ mod confirm_dialog;
 mod dashboard;
 mod destination_form;
 mod destinations;
+mod job_logs;
 mod jobs;
 mod login;
 mod source_form;
@@ -20,7 +21,13 @@ pub fn render(frame: &mut Frame, app: &App) {
             frame.render_widget(bg, frame.area());
             login::render(frame, app);
         }
-        Screen::Main => render_main(frame, app),
+        Screen::Main => {
+            render_main(frame, app);
+            // Show toast overlay if present
+            if let Some(toast) = &app.toast {
+                render_toast_overlay(frame, toast.is_error, &toast.message, frame.area());
+            }
+        }
         Screen::SourceForm => render_source_form(frame, app),
         Screen::DestinationForm => render_dest_form(frame, app),
         Screen::ConfirmDialog => {
@@ -32,6 +39,9 @@ pub fn render(frame: &mut Frame, app: &App) {
                 &app.confirm_dialog.message,
                 app.confirm_dialog.yes_selected,
             );
+        }
+        Screen::JobLogs => {
+            job_logs::render(frame, app);
         }
     }
 }
@@ -49,6 +59,41 @@ fn render_dest_form(frame: &mut Frame, app: &App) {
     let bg = Block::default().style(Style::default().bg(Color::Black));
     frame.render_widget(bg, frame.area());
     destination_form::render(frame, frame.area(), app);
+}
+
+/// Render a toast notification overlay near the bottom-center.
+fn render_toast_overlay(frame: &mut Frame, is_error: bool, message: &str, area: Rect) {
+    let toast_width = (message.len() as u16 + 8).min(area.width.saturating_sub(4));
+    let toast_height = 3u16;
+    let x = area.x + (area.width.saturating_sub(toast_width)) / 2;
+    let y = area.y + area.height.saturating_sub(toast_height + 1);
+
+    let toast_area = Rect {
+        x,
+        y,
+        width: toast_width,
+        height: toast_height,
+    };
+
+    let (border_color, prefix) = if is_error {
+        (Color::Red, " ✗ ")
+    } else {
+        (Color::Green, " ✓ ")
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(Color::Black));
+
+    let text = format!("{}{}", prefix, message);
+    let para = Paragraph::new(text)
+        .block(block)
+        .style(Style::default().fg(border_color))
+        .alignment(Alignment::Center);
+
+    frame.render_widget(Clear, toast_area);
+    frame.render_widget(para, toast_area);
 }
 
 /// Render the main tabbed interface.

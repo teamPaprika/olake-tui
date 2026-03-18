@@ -66,6 +66,15 @@ pub struct LogEntry {
     pub message: String,
 }
 
+/// A single log entry as returned from the job task logs API.
+/// Maps to the LogEntry shape from the API spec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobLogEntry {
+    pub level: String,
+    pub time: String,
+    pub message: String,
+}
+
 // ---------------------------------------------------------------------------
 // Entity (Source / Destination)
 // ---------------------------------------------------------------------------

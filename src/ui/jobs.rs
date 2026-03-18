@@ -144,7 +144,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     // Keybindings bar
     // -----------------------------------------------------------------------
     let keybindings = Paragraph::new(Line::from(Span::styled(
-        " n: new job | e: edit | s: sync now | c: cancel | d: delete | r: refresh | j/k: navigate",
+        " n: new | e: edit | s: sync | c: cancel | d: delete | r: refresh | l: view logs | j/k: navigate",
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(keybindings, chunks[1]);

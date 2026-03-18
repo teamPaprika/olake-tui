@@ -6,7 +6,10 @@ use tokio::sync::mpsc;
 
 use crate::event::{self, TuiEvent};
 use crate::olake::OlakeClient;
-use crate::olake::types::{Entity, EntityBase, EntityTestRequest, Job, TestConnectionStatus};
+use crate::olake::types::{
+    Entity, EntityBase, EntityTestRequest, Job, JobLogEntry, JobTask,
+    TaskLogsPaginationParams, TaskLogsDirection, TestConnectionStatus,
+};
 use crate::ui;
 
 // ---------------------------------------------------------------------------
@@ -26,6 +29,120 @@ pub enum Screen {
     DestinationForm,
     /// Confirmation dialog (shown as overlay over current content).
     ConfirmDialog,
+    /// Job logs viewer screen.
+    JobLogs,
+}
+
+// ---------------------------------------------------------------------------
+// Log direction
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogDirection {
+    Older,
+    Newer,
+}
+
+// ---------------------------------------------------------------------------
+// Log level filter
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevelFilter {
+    All,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevelFilter {
+    pub const ALL: [LogLevelFilter; 4] = [
+        LogLevelFilter::All,
+        LogLevelFilter::Info,
+        LogLevelFilter::Warn,
+        LogLevelFilter::Error,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            LogLevelFilter::All => "All",
+            LogLevelFilter::Info => "Info",
+            LogLevelFilter::Warn => "Warn",
+            LogLevelFilter::Error => "Error",
+        }
+    }
+
+    pub fn next(&self) -> LogLevelFilter {
+        let idx = Self::ALL.iter().position(|f| f == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(&self) -> LogLevelFilter {
+        let idx = Self::ALL.iter().position(|f| f == self).unwrap_or(0);
+        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// Returns true if the given log level string matches this filter.
+    pub fn matches(&self, level: &str) -> bool {
+        match self {
+            LogLevelFilter::All => true,
+            LogLevelFilter::Info => level.to_lowercase().contains("info"),
+            LogLevelFilter::Warn => {
+                let l = level.to_lowercase();
+                l.contains("warn") || l.contains("warning")
+            }
+            LogLevelFilter::Error => {
+                let l = level.to_lowercase();
+                l.contains("error") || l.contains("fatal")
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Log filter state
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+pub struct LogFilterState {
+    pub search_text: String,
+    pub level_filter: LogLevelFilter,
+    pub search_mode: bool, // true when user is typing in the search box
+}
+
+impl Default for LogLevelFilter {
+    fn default() -> Self {
+        LogLevelFilter::All
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Toast notification
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub message: String,
+    pub is_error: bool,
+    pub ticks_remaining: u32, // decrements on each tick; 0 = hidden
+}
+
+impl Toast {
+    pub fn info(msg: impl Into<String>) -> Self {
+        Toast {
+            message: msg.into(),
+            is_error: false,
+            ticks_remaining: 30, // ~3 seconds at 10fps
+        }
+    }
+
+    pub fn error(msg: impl Into<String>) -> Self {
+        Toast {
+            message: msg.into(),
+            is_error: true,
+            ticks_remaining: 40,
+        }
+    }
 }
 
 /// Top-level tabs in the main view.
@@ -731,6 +848,21 @@ pub enum Action {
     Cancel,
     /// Quit the application.
     Quit,
+    // -----------------------------------------------------------------------
+    // Job logs actions
+    // -----------------------------------------------------------------------
+    /// Open the job logs screen for the given job ID (and optional task ID).
+    OpenJobLogs { job_id: i64, task: JobTask },
+    /// Load logs in the given direction (pagination).
+    LoadJobLogs { direction: LogDirection },
+    /// Set log search text.
+    SearchLogs(String),
+    /// Set log level filter.
+    SetLogLevel(LogLevelFilter),
+    /// Download logs for the current job to a local file.
+    DownloadLogs,
+    /// Close the logs screen (return to main).
+    CloseLogs,
 }
 
 // ---------------------------------------------------------------------------
@@ -766,6 +898,21 @@ pub enum AppEvent {
     DestinationDeleted(String),
     ConnectionTestSuccess(String),
     ConnectionTestFailed(String),
+
+    // Job logs events
+    /// Log entries loaded; includes direction so the handler can prepend/append.
+    JobLogsLoaded {
+        entries: Vec<JobLogEntry>,
+        older_cursor: i64,
+        newer_cursor: i64,
+        has_more_older: bool,
+        has_more_newer: bool,
+        direction: LogDirection,
+    },
+    /// An error occurred while loading logs.
+    JobLogsError(String),
+    /// Log file has been saved locally; contains the path.
+    LogDownloadReady(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -899,6 +1046,34 @@ pub struct App {
     pub connection_test_result: Option<Result<String, String>>,
     pub connection_testing: bool,
 
+    // -----------------------------------------------------------------------
+    // Job logs state
+    // -----------------------------------------------------------------------
+    /// All log entries currently displayed.
+    pub job_logs: Vec<JobLogEntry>,
+    /// Cursor returned by the last request (used for next page).
+    pub job_logs_older_cursor: i64,
+    pub job_logs_newer_cursor: i64,
+    pub job_logs_has_more_older: bool,
+    pub job_logs_has_more_newer: bool,
+    /// Whether logs are currently being fetched.
+    pub job_logs_loading: bool,
+    /// Index of the currently selected log entry.
+    pub selected_log_idx: usize,
+    /// Log filter state (search + level).
+    pub log_filter: LogFilterState,
+    /// The job ID whose logs are displayed.
+    pub job_logs_job_id: Option<i64>,
+    /// The task currently being viewed (contains file_path etc.).
+    pub job_logs_task: Option<JobTask>,
+    /// Spinner for log loading animation.
+    pub log_loading_state: LoadingState,
+
+    // -----------------------------------------------------------------------
+    // Toast notification
+    // -----------------------------------------------------------------------
+    pub toast: Option<Toast>,
+
     /// Sender for dispatching actions to the background worker.
     action_tx: mpsc::UnboundedSender<Action>,
     /// Receiver for events from background workers.
@@ -939,6 +1114,19 @@ impl App {
             confirm_dialog: ConfirmDialogState::default(),
             connection_test_result: None,
             connection_testing: false,
+            // Job logs
+            job_logs: Vec::new(),
+            job_logs_older_cursor: -1,
+            job_logs_newer_cursor: -1,
+            job_logs_has_more_older: false,
+            job_logs_has_more_newer: false,
+            job_logs_loading: false,
+            selected_log_idx: 0,
+            log_filter: LogFilterState::default(),
+            job_logs_job_id: None,
+            job_logs_task: None,
+            log_loading_state: LoadingState::default(),
+            toast: None,
             action_tx,
             event_rx,
             client,
@@ -1001,6 +1189,16 @@ impl App {
         self.loading_sources.tick();
         self.loading_destinations.tick();
         self.loading_jobs.tick();
+        self.log_loading_state.tick();
+
+        // Tick down toast
+        if let Some(toast) = &mut self.toast {
+            if toast.ticks_remaining > 0 {
+                toast.ticks_remaining -= 1;
+            } else {
+                self.toast = None;
+            }
+        }
     }
 
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
@@ -1016,6 +1214,7 @@ impl App {
             Screen::SourceForm => self.handle_source_form_key(key),
             Screen::DestinationForm => self.handle_dest_form_key(key),
             Screen::ConfirmDialog => self.handle_confirm_dialog_key(key),
+            Screen::JobLogs => self.handle_job_logs_key(key),
         }
     }
 
@@ -1145,6 +1344,11 @@ impl App {
                 }
                 _ => {}
             },
+            KeyCode::Char('l') => {
+                if self.active_tab == Tab::Jobs {
+                    self.open_job_logs_for_selected();
+                }
+            }
             _ => {}
         }
     }
@@ -1804,6 +2008,356 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
+    // Job logs key handler
+    // -----------------------------------------------------------------------
+
+    fn handle_job_logs_key(&mut self, key: crossterm::event::KeyEvent) {
+        // If in search mode, handle text input
+        if self.log_filter.search_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.log_filter.search_mode = false;
+                }
+                KeyCode::Enter => {
+                    self.log_filter.search_mode = false;
+                    self.selected_log_idx = 0;
+                }
+                KeyCode::Backspace => {
+                    self.log_filter.search_text.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.log_filter.search_text.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.close_logs();
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.log_select_next();
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.log_select_prev();
+            }
+            KeyCode::PageDown => {
+                for _ in 0..20 {
+                    self.log_select_next();
+                }
+            }
+            KeyCode::PageUp => {
+                for _ in 0..20 {
+                    self.log_select_prev();
+                }
+            }
+            KeyCode::Char('g') => {
+                self.selected_log_idx = 0;
+            }
+            KeyCode::Char('G') => {
+                let visible = self.filtered_logs_count();
+                if visible > 0 {
+                    self.selected_log_idx = visible - 1;
+                }
+            }
+            KeyCode::Right => {
+                self.log_filter.level_filter = self.log_filter.level_filter.next();
+                self.selected_log_idx = 0;
+            }
+            KeyCode::Left => {
+                self.log_filter.level_filter = self.log_filter.level_filter.prev();
+                self.selected_log_idx = 0;
+            }
+            KeyCode::Char('/') => {
+                self.log_filter.search_mode = true;
+            }
+            KeyCode::Char('d') => {
+                self.download_logs();
+            }
+            KeyCode::Char('r') => {
+                // Refresh: reload from start
+                self.job_logs.clear();
+                self.job_logs_older_cursor = -1;
+                self.job_logs_newer_cursor = -1;
+                self.selected_log_idx = 0;
+                self.load_job_logs(LogDirection::Older);
+            }
+            KeyCode::Char('n') => {
+                // Load newer logs
+                if self.job_logs_has_more_newer && !self.job_logs_loading {
+                    self.load_job_logs(LogDirection::Newer);
+                }
+            }
+            KeyCode::Char('p') => {
+                // Load older logs
+                if self.job_logs_has_more_older && !self.job_logs_loading {
+                    self.load_job_logs(LogDirection::Older);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn filtered_logs_count(&self) -> usize {
+        self.job_logs
+            .iter()
+            .filter(|e| {
+                let level_ok = self.log_filter.level_filter.matches(&e.level);
+                let search_ok = if self.log_filter.search_text.is_empty() {
+                    true
+                } else {
+                    let q = self.log_filter.search_text.to_lowercase();
+                    e.message.to_lowercase().contains(&q)
+                        || e.level.to_lowercase().contains(&q)
+                };
+                level_ok && search_ok
+            })
+            .count()
+    }
+
+    fn log_select_next(&mut self) {
+        let count = self.filtered_logs_count();
+        if count > 0 {
+            self.selected_log_idx = (self.selected_log_idx + 1).min(count - 1);
+        }
+    }
+
+    fn log_select_prev(&mut self) {
+        self.selected_log_idx = self.selected_log_idx.saturating_sub(1);
+    }
+
+    fn close_logs(&mut self) {
+        self.screen = Screen::Main;
+        self.job_logs.clear();
+        self.job_logs_loading = false;
+        self.job_logs_job_id = None;
+        self.job_logs_task = None;
+        self.selected_log_idx = 0;
+        self.log_filter = LogFilterState::default();
+    }
+
+    // -----------------------------------------------------------------------
+    // Open job logs from Jobs tab
+    // -----------------------------------------------------------------------
+
+    fn open_job_logs_for_selected(&mut self) {
+        if self.jobs.is_empty() {
+            return;
+        }
+        let job = match self.jobs.get(self.selected_job_idx) {
+            Some(j) => j.clone(),
+            None => return,
+        };
+
+        // Fetch tasks first, then open logs
+        let job_id = job.id;
+        let client = self.client.clone();
+        let tx = self.app_event_tx.clone();
+
+        // Reset log state
+        self.job_logs.clear();
+        self.job_logs_older_cursor = -1;
+        self.job_logs_newer_cursor = -1;
+        self.job_logs_has_more_older = false;
+        self.job_logs_has_more_newer = false;
+        self.selected_log_idx = 0;
+        self.log_filter = LogFilterState::default();
+        self.job_logs_job_id = Some(job_id);
+        self.job_logs_task = None;
+        self.job_logs_loading = true;
+        self.log_loading_state.start();
+        self.screen = Screen::JobLogs;
+
+        // Spawn: fetch tasks → pick most recent → load logs
+        tokio::spawn(async move {
+            let tasks = match client.jobs_get_tasks(job_id).await {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::JobLogsError(format!(
+                        "Failed to fetch tasks: {}",
+                        e
+                    )));
+                    return;
+                }
+            };
+
+            // Pick the most recent task (last in list)
+            let task = match tasks.into_iter().last() {
+                Some(t) => t,
+                None => {
+                    let _ = tx.send(AppEvent::JobLogsError(
+                        "No tasks found for this job.".to_string(),
+                    ));
+                    return;
+                }
+            };
+
+            let file_path = task.file_path.clone();
+            let params = TaskLogsPaginationParams {
+                cursor: -1,
+                limit: 1000,
+                direction: TaskLogsDirection::Older,
+            };
+
+            let task_id = task.runtime.clone(); // runtime is used as task ID
+            match client
+                .jobs_get_logs(job_id, &task_id, params, &file_path)
+                .await
+            {
+                Ok(resp) => {
+                    let entries: Vec<JobLogEntry> = resp
+                        .logs
+                        .into_iter()
+                        .map(|l| JobLogEntry {
+                            level: l.level,
+                            time: l.time,
+                            message: l.message,
+                        })
+                        .collect();
+                    let _ = tx.send(AppEvent::JobLogsLoaded {
+                        entries,
+                        older_cursor: resp.older_cursor,
+                        newer_cursor: resp.newer_cursor,
+                        has_more_older: resp.has_more_older,
+                        has_more_newer: resp.has_more_newer,
+                        direction: LogDirection::Older,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::JobLogsError(format!(
+                        "Failed to load logs: {}",
+                        e
+                    )));
+                }
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Load job logs (pagination)
+    // -----------------------------------------------------------------------
+
+    fn load_job_logs(&mut self, direction: LogDirection) {
+        if self.job_logs_loading {
+            return;
+        }
+        let job_id = match self.job_logs_job_id {
+            Some(id) => id,
+            None => return,
+        };
+        let task = match &self.job_logs_task {
+            Some(t) => t.clone(),
+            None => return,
+        };
+
+        self.job_logs_loading = true;
+        self.log_loading_state.start();
+
+        let cursor = match direction {
+            LogDirection::Older => self.job_logs_older_cursor,
+            LogDirection::Newer => self.job_logs_newer_cursor,
+        };
+
+        let api_direction = match direction {
+            LogDirection::Older => TaskLogsDirection::Older,
+            LogDirection::Newer => TaskLogsDirection::Newer,
+        };
+
+        let params = TaskLogsPaginationParams {
+            cursor,
+            limit: 500,
+            direction: api_direction,
+        };
+
+        let client = self.client.clone();
+        let tx = self.app_event_tx.clone();
+        let task_id = task.runtime.clone();
+        let file_path = task.file_path.clone();
+
+        tokio::spawn(async move {
+            match client
+                .jobs_get_logs(job_id, &task_id, params, &file_path)
+                .await
+            {
+                Ok(resp) => {
+                    let entries: Vec<JobLogEntry> = resp
+                        .logs
+                        .into_iter()
+                        .map(|l| JobLogEntry {
+                            level: l.level,
+                            time: l.time,
+                            message: l.message,
+                        })
+                        .collect();
+                    let _ = tx.send(AppEvent::JobLogsLoaded {
+                        entries,
+                        older_cursor: resp.older_cursor,
+                        newer_cursor: resp.newer_cursor,
+                        has_more_older: resp.has_more_older,
+                        has_more_newer: resp.has_more_newer,
+                        direction,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::JobLogsError(format!(
+                        "Failed to load logs: {}",
+                        e
+                    )));
+                }
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Download logs
+    // -----------------------------------------------------------------------
+
+    fn download_logs(&mut self) {
+        let job_id = match self.job_logs_job_id {
+            Some(id) => id,
+            None => return,
+        };
+        let task_id = match &self.job_logs_task {
+            Some(t) => t.runtime.clone(),
+            None => return,
+        };
+
+        let client = self.client.clone();
+        let tx = self.app_event_tx.clone();
+
+        tokio::spawn(async move {
+            match client.jobs_download_logs(job_id, &task_id).await {
+                Ok(bytes) => {
+                    // Save to ~/.local/share/olake/logs/<job_id>-<timestamp>.log
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                    let log_dir =
+                        std::path::PathBuf::from(format!("{}/.local/share/olake/logs", home));
+                    let _ = tokio::fs::create_dir_all(&log_dir).await;
+                    let ts = chrono_timestamp();
+                    let filename = format!("{}-{}.tar.gz", job_id, ts);
+                    let path = log_dir.join(&filename);
+                    match tokio::fs::write(&path, &bytes).await {
+                        Ok(_) => {
+                            let path_str = path.to_string_lossy().to_string();
+                            let _ = tx.send(AppEvent::LogDownloadReady(path_str));
+                        }
+                        Err(e) => {
+                            let _ =
+                                tx.send(AppEvent::JobLogsError(format!("Save failed: {}", e)));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ =
+                        tx.send(AppEvent::JobLogsError(format!("Download failed: {}", e)));
+                }
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------------
     // AppEvent handling
     // -----------------------------------------------------------------------
 
@@ -1910,6 +2464,67 @@ impl App {
                 self.connection_test_result = Some(Err(msg.clone()));
                 self.error_message = Some(format!("✗ Connection failed: {}", msg));
             }
+
+            // Job logs events
+            AppEvent::JobLogsLoaded {
+                entries,
+                older_cursor,
+                newer_cursor,
+                has_more_older,
+                has_more_newer,
+                direction,
+            } => {
+                self.job_logs_loading = false;
+                self.log_loading_state.stop();
+                self.job_logs_older_cursor = older_cursor;
+                self.job_logs_newer_cursor = newer_cursor;
+                self.job_logs_has_more_older = has_more_older;
+                self.job_logs_has_more_newer = has_more_newer;
+                match direction {
+                    LogDirection::Older => {
+                        // Prepend older entries
+                        let mut new_logs = entries;
+                        new_logs.extend(self.job_logs.drain(..));
+                        self.job_logs = new_logs;
+                        // Adjust selection to account for prepended entries
+                    }
+                    LogDirection::Newer => {
+                        // Append newer entries
+                        self.job_logs.extend(entries);
+                    }
+                }
+                // Clamp selection
+                let count = self.filtered_logs_count();
+                if count > 0 && self.selected_log_idx >= count {
+                    self.selected_log_idx = count - 1;
+                }
+            }
+            AppEvent::JobLogsError(msg) => {
+                self.job_logs_loading = false;
+                self.log_loading_state.stop();
+                // If we're on the logs screen but have no task, go back to main
+                if self.job_logs_task.is_none() && self.screen == Screen::JobLogs {
+                    self.screen = Screen::Main;
+                    self.toast = Some(Toast::error(format!("Logs: {}", msg)));
+                } else {
+                    self.toast = Some(Toast::error(format!("Logs error: {}", msg)));
+                }
+            }
+            AppEvent::LogDownloadReady(path) => {
+                self.toast = Some(Toast::info(format!("Logs saved: {}", path)));
+            }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Simple timestamp helper (no chrono dep — just uses SystemTime)
+// ---------------------------------------------------------------------------
+
+fn chrono_timestamp() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
