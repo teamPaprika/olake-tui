@@ -201,7 +201,7 @@ func (m JobsModel) View() string {
 	}
 
 	list := strings.Join(rows, "\n")
-	help := StyleHelp.Render("s:sync  c:cancel  l:logs  p:pause  d:delete  r:refresh")
+	help := StyleHelp.Render("Enter:detail  S:settings  s:sync  c:cancel  l:logs  p:pause  d:delete  r:refresh")
 
 	return lipgloss.JoinVertical(lipgloss.Left, title, "", list, "", help)
 }

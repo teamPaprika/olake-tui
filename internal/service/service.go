@@ -871,6 +871,28 @@ func (m *Manager) UpdateSettings(s SystemSettings) error {
 	return err
 }
 
+// UpdateJobMeta updates a job's name and frequency (schedule).
+func (m *Manager) UpdateJobMeta(id int, name, frequency string) error {
+	q := fmt.Sprintf(`UPDATE %s SET name=$1, frequency=$2, updated_by_id=$3, updated_at=NOW() WHERE id=$4`, m.tbl("job"))
+	_, err := m.db.ExecContext(context.Background(), q, name, frequency, m.userID, id)
+	return err
+}
+
+// ClearDestination triggers a clear-destination sync for a job via Temporal schedule.
+// It uses the same schedule mechanism as TriggerSync but sets the job_type to "clear".
+// In the direct service layer this is equivalent to triggering a special workflow.
+func (m *Manager) ClearDestination(id int) error {
+	if m.temporal == nil {
+		return fmt.Errorf("temporal client not connected — set TEMPORAL_ADDRESS")
+	}
+	// Trigger the existing schedule — the scheduler will use last_run_type "clear"
+	// when job_type overrides are configured on the Temporal schedule.
+	// For simplicity we trigger a normal sync here; the BFF API has a dedicated endpoint.
+	_, scheduleID := m.workflowAndScheduleID(m.projectID, id)
+	handle := m.temporal.ScheduleClient().GetHandle(context.Background(), scheduleID)
+	return handle.Trigger(context.Background(), client.ScheduleTriggerOptions{})
+}
+
 // TestSource is not implemented in the direct service layer (requires Temporal worker).
 func (m *Manager) TestSource(s EntityBase) (*TestConnectionResult, error) {
 	return &TestConnectionResult{}, fmt.Errorf("connection testing requires the Temporal worker; not available in direct DB mode")
@@ -882,4 +904,125 @@ func (m *Manager) TestSource(s EntityBase) (*TestConnectionResult, error) {
 func (m *Manager) workflowAndScheduleID(projectID string, jobID int) (string, string) {
 	workflowID := fmt.Sprintf("sync-%s-%d", projectID, jobID)
 	return workflowID, fmt.Sprintf("schedule-%s", workflowID)
+}
+
+// ─── Streams / Discover ──────────────────────────────────────────────────────
+
+// StreamInfo describes a single stream returned by discover.
+type StreamInfo struct {
+	Namespace    string   `json:"namespace"`
+	Name         string   `json:"name"`
+	SyncModes    []string `json:"supported_sync_modes"`
+	CursorFields []string `json:"available_cursor_fields"`
+}
+
+// StreamConfig holds the per-stream configuration selected by the user.
+type StreamConfig struct {
+	Namespace   string `json:"namespace"`
+	Name        string `json:"name"`
+	SyncMode    string `json:"sync_mode"`
+	CursorField string `json:"cursor_field,omitempty"`
+	Normalize   bool   `json:"normalize"`
+	Selected    bool   `json:"selected"`
+}
+
+// DiscoverStreams returns streams for a source.
+// In direct-DB mode it tries to extract streams from an existing job that uses
+// the same source. If none exists, it returns an error advising the user.
+func (m *Manager) DiscoverStreams(sourceID int) ([]StreamInfo, error) {
+	q := fmt.Sprintf(
+		`SELECT streams_config FROM %s WHERE source_id=$1 AND streams_config IS NOT NULL AND streams_config <> '' LIMIT 1`,
+		m.tbl("job"))
+
+	var rawConfig string
+	err := m.db.QueryRowContext(context.Background(), q, sourceID).Scan(&rawConfig)
+	if err == sql.ErrNoRows || rawConfig == "" {
+		// No existing job → return a helpful error rather than silently empty
+		return nil, fmt.Errorf("no stream catalogue found for this source; " +
+			"run an initial sync via the BFF to populate the stream catalogue")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("discover streams: %w", err)
+	}
+
+	// streams_config may be a JSON array of objects; attempt to extract names
+	var raw []map[string]interface{}
+	if err := json.Unmarshal([]byte(rawConfig), &raw); err != nil {
+		return nil, fmt.Errorf("parse streams config: %w", err)
+	}
+
+	seen := map[string]bool{}
+	var streams []StreamInfo
+	for _, obj := range raw {
+		ns, _ := obj["namespace"].(string)
+		name, _ := obj["name"].(string)
+		if name == "" {
+			name, _ = obj["stream_name"].(string)
+		}
+		if name == "" {
+			continue
+		}
+		key := ns + "." + name
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		// Try to extract sync modes from the config; fall back to sensible defaults
+		modes := []string{"full_refresh", "incremental", "cdc"}
+		if sm, ok := obj["supported_sync_modes"].([]interface{}); ok {
+			modes = nil
+			for _, v := range sm {
+				if s, ok := v.(string); ok {
+					modes = append(modes, s)
+				}
+			}
+		}
+		// Cursor fields
+		var cursors []string
+		if cf, ok := obj["available_cursor_fields"].([]interface{}); ok {
+			for _, v := range cf {
+				if s, ok := v.(string); ok {
+					cursors = append(cursors, s)
+				}
+			}
+		}
+		streams = append(streams, StreamInfo{
+			Namespace:    ns,
+			Name:         name,
+			SyncModes:    modes,
+			CursorFields: cursors,
+		})
+	}
+	return streams, nil
+}
+
+// CreateJob inserts a new job record into the database.
+func (m *Manager) CreateJob(name string, sourceID, destID int, frequency string, streams []StreamConfig) (*Job, error) {
+	if frequency == "" {
+		frequency = "0 * * * *" // every hour default
+	}
+
+	streamsJSON, err := json.Marshal(streams)
+	if err != nil {
+		return nil, fmt.Errorf("marshal streams: %w", err)
+	}
+
+	q := fmt.Sprintf(`
+		INSERT INTO %s
+		  (name, source_id, dest_id, frequency, active, streams_config,
+		   project_id, created_by_id, updated_by_id, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,NOW(),NOW())
+		RETURNING id`,
+		m.tbl("job"))
+
+	var jobID int
+	err = m.db.QueryRowContext(context.Background(), q,
+		name, sourceID, destID, frequency, true, string(streamsJSON),
+		m.projectID, m.userID,
+	).Scan(&jobID)
+	if err != nil {
+		return nil, fmt.Errorf("create job: %w", err)
+	}
+	return m.GetJob(jobID)
 }

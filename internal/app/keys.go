@@ -28,6 +28,12 @@ type KeyMap struct {
 	Logs    key.Binding
 	Pause   key.Binding
 
+	// Job operations
+	Settings     key.Binding // capital S — open job settings
+	Detail       key.Binding // enter — open job detail
+	ClearDest    key.Binding // clear destination action
+	Tab5         key.Binding // '5' — system settings tab
+
 	// App
 	Quit key.Binding
 	Help key.Binding
@@ -57,6 +63,11 @@ func DefaultKeyMap() KeyMap {
 		Cancel:  key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "cancel run")),
 		Logs:    key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "logs")),
 		Pause:   key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pause/resume")),
+
+		Settings:  key.NewBinding(key.WithKeys("S"), key.WithHelp("S", "job settings")),
+		Detail:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "job detail")),
+		ClearDest: key.NewBinding(key.WithKeys("X"), key.WithHelp("X", "clear destination")),
+		Tab5:      key.NewBinding(key.WithKeys("5"), key.WithHelp("5", "system settings")),
 
 		Quit: key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 		Help: key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
