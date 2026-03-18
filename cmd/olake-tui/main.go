@@ -27,7 +27,10 @@ import (
 	"github.com/datazip-inc/olake-tui/internal/service"
 )
 
-const version = "0.2.0-direct"
+// version is the build version string, overridable via ldflags at build time:
+//
+//	go build -ldflags "-X main.version=v1.0.0" -o bin/olake-tui ./cmd/olake-tui/
+var version = "v0.2.0-direct"
 
 func main() {
 	var (
@@ -41,7 +44,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("olake-tui v%s\n", version)
+		fmt.Printf("olake-tui %s\n", version)
 		os.Exit(0)
 	}
 
@@ -65,8 +68,8 @@ func main() {
 	}
 	defer svc.Close()
 
-	// Create root model
-	model := app.New(svc)
+	// Create root model (version injected at build time via ldflags)
+	model := app.New(svc, version)
 
 	// Run Bubble Tea program in alternate screen (fullscreen TUI)
 	p := tea.NewProgram(

@@ -41,6 +41,7 @@ type Service interface {
 	CreateDestination(d EntityBase) (*EntityBase, error)
 	UpdateDestination(id int, d EntityBase) (*EntityBase, error)
 	DeleteDestination(id int) error
+	TestDestination(d EntityBase, sourceType, sourceVersion string) (*TestConnectionResult, error)
 
 	// ── Jobs ──────────────────────────────────────────────────────────────
 

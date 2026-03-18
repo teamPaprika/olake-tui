@@ -34,33 +34,34 @@ type MockService struct {
 	TestResult   *TestConnectionResult
 
 	// ── Error injection ───────────────────────────────────────────────────
-	LoginErr          error
-	ListSourcesErr    error
-	GetSourceErr      error
-	CreateSourceErr   error
-	UpdateSourceErr   error
-	DeleteSourceErr   error
-	TestSourceErr     error
-	DiscoverErr       error
-	ListDestsErr      error
-	GetDestErr        error
-	CreateDestErr     error
-	UpdateDestErr     error
-	DeleteDestErr     error
-	ListJobsErr       error
-	GetJobErr         error
-	CreateJobErr      error
-	UpdateJobMetaErr  error
-	DeleteJobErr      error
-	TriggerSyncErr    error
-	CancelJobErr      error
-	ActivateJobErr    error
-	ListTasksErr      error
-	GetTaskLogsErr    error
-	ClearDestErr      error
-	GetSettingsErr    error
-	UpdateSettingsErr error
-	ValidateSchemaErr error
+	LoginErr           error
+	ListSourcesErr     error
+	GetSourceErr       error
+	CreateSourceErr    error
+	UpdateSourceErr    error
+	DeleteSourceErr    error
+	TestSourceErr      error
+	TestDestinationErr error
+	DiscoverErr        error
+	ListDestsErr       error
+	GetDestErr         error
+	CreateDestErr      error
+	UpdateDestErr      error
+	DeleteDestErr      error
+	ListJobsErr        error
+	GetJobErr          error
+	CreateJobErr       error
+	UpdateJobMetaErr   error
+	DeleteJobErr       error
+	TriggerSyncErr     error
+	CancelJobErr       error
+	ActivateJobErr     error
+	ListTasksErr       error
+	GetTaskLogsErr     error
+	ClearDestErr       error
+	GetSettingsErr     error
+	UpdateSettingsErr  error
+	ValidateSchemaErr  error
 
 	// ── Call counters (useful for assertions) ─────────────────────────────
 	Calls map[string]int
@@ -198,6 +199,14 @@ func (m *MockService) TestSource(s EntityBase) (*TestConnectionResult, error) {
 	m.record("TestSource")
 	if m.TestSourceErr != nil {
 		return nil, m.TestSourceErr
+	}
+	return m.TestResult, nil
+}
+
+func (m *MockService) TestDestination(d EntityBase, sourceType, sourceVersion string) (*TestConnectionResult, error) {
+	m.record("TestDestination")
+	if m.TestDestinationErr != nil {
+		return nil, m.TestDestinationErr
 	}
 	return m.TestResult, nil
 }

@@ -39,8 +39,9 @@ const (
 	TabSources
 	TabDestinations
 	TabSettings
-	TabSystemSettings
 )
+
+const jobLogsPageSize = 200
 
 // --- Async result message types ---
 
@@ -64,8 +65,10 @@ type msgSyncTriggered struct{ err error }
 type msgCancelDone struct{ err error }
 type msgActivateDone struct{ err error }
 type msgLogsLoaded struct {
-	logs []service.LogEntry
-	err  error
+	jobID    int
+	filePath string
+	resp     *service.TaskLogsResponse
+	err      error
 }
 type msgToastExpired struct{}
 type msgTasksLoaded struct {
@@ -92,36 +95,40 @@ type msgSourceUpdated struct{ err error }
 type msgDestCreated struct{ err error }
 type msgDestUpdated struct{ err error }
 type msgTestSourceDone struct{ err error }
-type msgTestConnectionDone struct{ err error; logs []string }
+type msgTestDestinationDone struct{ err error }
+type msgTestConnectionDone struct {
+	err  error
+	logs []string
+}
 
 // modalContext tracks what the active modal should do on confirm/cancel/alt.
 type modalContext int
 
 const (
-	modalCtxNone modalContext = iota
-	modalCtxTestConnectionSave            // after success → save entity
-	modalCtxEntityCancelSource            // cancel source form
-	modalCtxEntityCancelDest              // cancel dest form
-	modalCtxEntityCancelJob               // cancel job wizard
-	modalCtxEntityCancelJobEdit           // cancel job edit
-	modalCtxEntitySavedSource             // source saved → nav
-	modalCtxEntitySavedDest               // dest saved → nav
-	modalCtxEntitySavedJob                // job saved → nav
-	modalCtxEntityEditSource              // edit source with jobs → confirm → save
-	modalCtxEntityEditDest                // edit dest with jobs → confirm → save
-	modalCtxDeleteSource                  // delete source (with jobs table)
-	modalCtxDeleteDest                    // delete dest (with jobs table)
-	modalCtxDeleteJob                     // delete job
-	modalCtxDeleteJobFromSettings         // delete job from settings → nav /jobs
-	modalCtxClearDestination              // clear destination first confirm
-	modalCtxClearData                     // clear destination second confirm (execute)
-	modalCtxSpecFailedSource              // retry spec fetch for source
-	modalCtxSpecFailedDest                // retry spec fetch for destination
-	modalCtxStreamDifference              // confirm save with stream diffs
-	modalCtxIngestionModeChange           // apply ingestion mode to all streams
-	modalCtxResetStreams                  // leave streams step
-	modalCtxStreamEditDisabled            // editing disabled info
-	modalCtxUpdates                       // updates info
+	modalCtxNone                  modalContext = iota
+	modalCtxTestConnectionSave                 // after success → save entity
+	modalCtxEntityCancelSource                 // cancel source form
+	modalCtxEntityCancelDest                   // cancel dest form
+	modalCtxEntityCancelJob                    // cancel job wizard
+	modalCtxEntityCancelJobEdit                // cancel job edit
+	modalCtxEntitySavedSource                  // source saved → nav
+	modalCtxEntitySavedDest                    // dest saved → nav
+	modalCtxEntitySavedJob                     // job saved → nav
+	modalCtxEntityEditSource                   // edit source with jobs → confirm → save
+	modalCtxEntityEditDest                     // edit dest with jobs → confirm → save
+	modalCtxDeleteSource                       // delete source (with jobs table)
+	modalCtxDeleteDest                         // delete dest (with jobs table)
+	modalCtxDeleteJob                          // delete job
+	modalCtxDeleteJobFromSettings              // delete job from settings → nav /jobs
+	modalCtxClearDestination                   // clear destination first confirm
+	modalCtxClearData                          // clear destination second confirm (execute)
+	modalCtxSpecFailedSource                   // retry spec fetch for source
+	modalCtxSpecFailedDest                     // retry spec fetch for destination
+	modalCtxStreamDifference                   // confirm save with stream diffs
+	modalCtxIngestionModeChange                // apply ingestion mode to all streams
+	modalCtxResetStreams                       // leave streams step
+	modalCtxStreamEditDisabled                 // editing disabled info
+	modalCtxUpdates                            // updates info
 )
 
 // confirmContext identifies what action a confirmation dialog is for.
@@ -140,12 +147,12 @@ const (
 
 // Model is the root Bubble Tea model.
 type Model struct {
-	svc     service.Service
-	keys    KeyMap
-	screen  Screen
-	tab     Tab
-	width   int
-	height  int
+	svc    service.Service
+	keys   KeyMap
+	screen Screen
+	tab    Tab
+	width  int
+	height int
 
 	// Sub-models
 	login        ui.LoginModel
@@ -158,17 +165,17 @@ type Model struct {
 	confirmID    int
 
 	// Job detail / settings sub-models
-	jobDetail    *ui.JobDetailModel
-	jobSettings  *ui.JobSettingsModel
+	jobDetail   *ui.JobDetailModel
+	jobSettings *ui.JobSettingsModel
 
 	// System settings sub-model
-	sysSettings  *ui.SettingsModel
+	sysSettings *ui.SettingsModel
 
 	// Job creation wizard
-	wizard       *ui.JobWizardModel
+	wizard *ui.JobWizardModel
 
 	// Entity (source/dest) create/edit form
-	entityForm   *ui.EntityFormModel
+	entityForm *ui.EntityFormModel
 
 	// Modal overlay system (all 17 modals)
 	modalState   ui.ModalState
@@ -177,9 +184,9 @@ type Model struct {
 	modalPayload string // extra string payload (e.g. error message, job name)
 
 	// Data
-	jobList   []service.Job
-	srcList   []service.Source
-	dstList   []service.Destination
+	jobList []service.Job
+	srcList []service.Source
+	dstList []service.Destination
 
 	// Toast notification
 	toast      string
@@ -194,7 +201,12 @@ type Model struct {
 }
 
 // New creates the root application model.
-func New(svc service.Service) Model {
+// version is the build version string (e.g. "v0.2.0-direct"), typically
+// injected via ldflags: -ldflags "-X main.version=v1.0.0".
+func New(svc service.Service, version string) Model {
+	if version == "" {
+		version = "dev"
+	}
 	return Model{
 		svc:          svc,
 		keys:         DefaultKeyMap(),
@@ -204,7 +216,7 @@ func New(svc service.Service) Model {
 		jobs:         ui.NewJobsModel(),
 		sources:      ui.NewSourcesModel(),
 		destinations: ui.NewDestinationsModel(),
-		version:      "0.1.0",
+		version:      version,
 	}
 }
 
@@ -422,11 +434,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// ---------- Logs ----------
 	case msgLogsLoaded:
-		if m.logs != nil {
+		if m.logs != nil && m.logs.JobID() == msg.jobID && m.logs.FilePath() == msg.filePath {
 			if msg.err != nil {
 				m.logs.SetError(msg.err.Error())
-			} else {
-				m.logs.SetLogs(msg.logs)
+			} else if msg.resp != nil {
+				m.logs.ApplyResponse(msg.resp)
 			}
 		}
 
@@ -505,7 +517,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case ui.JobDetailLogsMsg:
-		return m.openLogsForTask(msg.JobID, msg.FilePath), nil
+		return m.openLogsForTask(msg.JobID, msg.FilePath)
 
 	case ui.SettingsSavedMsg:
 		url := msg.WebhookURL
@@ -622,6 +634,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, showToast("Connection test failed: "+msg.err.Error(), true))
 		} else {
 			cmds = append(cmds, showToast("Connection test succeeded!", false))
+		}
+
+	case msgTestDestinationDone:
+		if msg.err != nil {
+			cmds = append(cmds, showToast("Destination test failed: "+msg.err.Error(), true))
+		} else {
+			cmds = append(cmds, showToast("Destination test succeeded!", false))
 		}
 
 	// ---------- Test connection with modal ----------
@@ -784,7 +803,27 @@ func (m Model) handleKey(msg tea.KeyMsg, cmds []tea.Cmd) (tea.Model, tea.Cmd) {
 	}
 
 	// Log viewer
-	if m.screen == ScreenJobLogs {
+	if m.screen == ScreenJobLogs && m.logs != nil {
+		switch msg.String() {
+		case "p":
+			if m.logs.IsLoading() {
+				return m, nil
+			}
+			if cursor, ok := m.logs.OlderCursor(); ok {
+				m.logs.SetLoading(true)
+				return m, m.loadLogs(m.logs.JobID(), m.logs.FilePath(), cursor, "older")
+			}
+			return m, showToast("No older logs", false)
+		case "n":
+			if m.logs.IsLoading() {
+				return m, nil
+			}
+			if cursor, ok := m.logs.NewerCursor(); ok {
+				m.logs.SetLoading(true)
+				return m, m.loadLogs(m.logs.JobID(), m.logs.FilePath(), cursor, "newer")
+			}
+			return m, showToast("No newer logs", false)
+		}
 		var cmd tea.Cmd
 		logs, cmd := m.logs.Update(msg)
 		m.logs = &logs
@@ -836,10 +875,8 @@ func (m Model) handleKey(msg tea.KeyMsg, cmds []tea.Cmd) (tea.Model, tea.Cmd) {
 		return m.switchTab(TabDestinations)
 	case "4":
 		return m.switchTab(TabSettings)
-	case "5":
-		return m.openSystemSettings()
 	case "tab":
-		next := (int(m.tab) + 1) % 5
+		next := (int(m.tab) + 1) % 4
 		return m.switchTab(Tab(next))
 	}
 
@@ -878,7 +915,7 @@ func (m Model) handleTabKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "l":
 			if j := m.jobs.SelectedJob(); j != nil {
-				return m.openLogs(j.ID), nil
+				return m.openLogs(j.ID)
 			}
 		case "enter":
 			if j := m.jobs.SelectedJob(); j != nil {
@@ -949,8 +986,13 @@ func (m Model) handleTabKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "t":
 			if d := m.destinations.SelectedDestination(); d != nil {
-				// Destination connection test not implemented in direct service layer.
-				return m, showToast("Connection test requires BFF server (not available in direct mode)", true)
+				eb := service.EntityBase{Name: d.Name, Type: d.Type, Version: d.Version, Config: d.Config}
+				svc := m.svc
+				testCmd := func() tea.Msg {
+					_, err := svc.TestDestination(eb, "", "")
+					return msgTestDestinationDone{err: err}
+				}
+				return m, tea.Batch(showToast("Testing connection…", false), testCmd)
 			}
 		case "d":
 			if d := m.destinations.SelectedDestination(); d != nil {
@@ -968,14 +1010,6 @@ func (m Model) handleTabKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
-	case TabSettings:
-		// Legacy settings tab — redirect to system settings
-		newM, cmd := m.openSystemSettings()
-		return newM, cmd
-
-	case TabSystemSettings:
-		newM, cmd := m.openSystemSettings()
-		return newM, cmd
 	}
 
 	return m, nil
@@ -1420,7 +1454,7 @@ func (m Model) screenBeforeConfirm() Screen {
 		return ScreenSources
 	case TabDestinations:
 		return ScreenDestinations
-	case TabSettings, TabSystemSettings:
+	case TabSettings:
 		return ScreenSystemSettings
 	default:
 		return ScreenJobs
@@ -1459,27 +1493,27 @@ func (m Model) switchTab(t Tab) (Model, tea.Cmd) {
 			cmd = m.loadDests()
 		}
 	case TabSettings:
-		m.screen = ScreenSettings
-	case TabSystemSettings:
-		m.screen = ScreenSystemSettings
+		return m.openSystemSettings()
 	}
 	return m, cmd
 }
 
 // openLogs loads task list and then opens the log viewer.
-func (m Model) openLogs(jobID int) Model {
+func (m Model) openLogs(jobID int) (Model, tea.Cmd) {
 	logModel := ui.NewJobLogsModel(jobID, "latest", "", m.width, m.height)
+	logModel.SetLoading(true)
 	m.logs = &logModel
 	m.screen = ScreenJobLogs
-	return m
+	return m, m.loadLogs(jobID, "", -1, "older")
 }
 
 // openLogsForTask opens the log viewer for a specific task by file path.
-func (m Model) openLogsForTask(jobID int, filePath string) Model {
+func (m Model) openLogsForTask(jobID int, filePath string) (Model, tea.Cmd) {
 	logModel := ui.NewJobLogsModel(jobID, "task", filePath, m.width, m.height)
+	logModel.SetLoading(true)
 	m.logs = &logModel
 	m.screen = ScreenJobLogs
-	return m
+	return m, m.loadLogs(jobID, filePath, -1, "older")
 }
 
 // openJobDetail opens the job detail screen and starts loading task history.
@@ -1512,7 +1546,7 @@ func (m Model) openSystemSettings() (Model, tea.Cmd) {
 	sysSettings.SetSize(m.width, m.height)
 	m.sysSettings = &sysSettings
 	m.screen = ScreenSystemSettings
-	m.tab = TabSystemSettings
+	m.tab = TabSettings
 
 	cmd := func() tea.Msg {
 		settings, err := m.svc.GetSettings()
@@ -1676,6 +1710,18 @@ func (m Model) loadDests() tea.Cmd {
 	}
 }
 
+func (m Model) loadLogs(jobID int, filePath string, cursor int64, direction string) tea.Cmd {
+	svc := m.svc
+	taskID := ""
+	if m.logs != nil {
+		taskID = m.logs.TaskID()
+	}
+	return func() tea.Msg {
+		resp, err := svc.GetTaskLogs(jobID, taskID, filePath, cursor, jobLogsPageSize, direction)
+		return msgLogsLoaded{jobID: jobID, filePath: filePath, resp: resp, err: err}
+	}
+}
+
 // --- View ---
 
 // View renders the full TUI.
@@ -1759,7 +1805,6 @@ func (m Model) renderTabs() string {
 		{TabSources, "Sources", "2"},
 		{TabDestinations, "Destinations", "3"},
 		{TabSettings, "Settings", "4"},
-		{TabSystemSettings, "System", "5"},
 	}
 
 	var parts []string
@@ -1791,8 +1836,6 @@ func (m Model) renderContent(height int) string {
 	case TabDestinations:
 		return m.destinations.View()
 	case TabSettings:
-		return m.renderSettingsPlaceholder()
-	case TabSystemSettings:
 		if m.sysSettings != nil {
 			return m.sysSettings.View()
 		}
@@ -1806,9 +1849,9 @@ func (m Model) renderSettingsPlaceholder() string {
 	return lipgloss.JoinVertical(lipgloss.Left,
 		ui.StyleTitle.Render("Settings"),
 		"",
-		ui.StyleMuted.Render("Press 5 or enter to open System Settings"),
+		ui.StyleMuted.Render("Loading settings…"),
 		"",
-		ui.StyleHelp.Render("r: refresh settings"),
+		ui.StyleHelp.Render("r: refresh"),
 	)
 }
 
@@ -1817,7 +1860,7 @@ func (m Model) renderStatusBar() string {
 	var hint string
 	switch m.screen {
 	case ScreenJobs:
-		hint = "1-5:tabs  n:new  Enter:detail  S:settings  s:sync  c:cancel  l:logs  p:pause  d:delete  u:updates  r:refresh  q:quit"
+		hint = "1-4:tabs  n:new  Enter:detail  S:settings  s:sync  c:cancel  l:logs  p:pause  d:delete  u:updates  r:refresh  q:quit"
 	case ScreenJobDetail:
 		hint = "↑↓/j/k:navigate  enter/l:logs  s:sync  c:cancel  esc:back"
 	case ScreenJobSettings:
@@ -1825,15 +1868,15 @@ func (m Model) renderStatusBar() string {
 	case ScreenSystemSettings:
 		hint = "tab/↑↓:navigate  enter:activate  esc:back"
 	case ScreenSources:
-		hint = "1-5:tabs  a:add  e:edit  d:delete  t:test  r:refresh  q:quit"
+		hint = "1-4:tabs  a:add  e:edit  d:delete  t:test  r:refresh  q:quit"
 	case ScreenDestinations:
-		hint = "1-5:tabs  a:add  e:edit  d:delete  t:test  r:refresh  q:quit"
+		hint = "1-4:tabs  a:add  e:edit  d:delete  t:test  r:refresh  q:quit"
 	case ScreenSourceForm, ScreenDestForm:
 		hint = "tab/↑↓:move  ←→:change type  enter:next/submit  esc:back"
 	case ScreenJobLogs:
-		hint = "↑↓/pgup/pgdn:scroll  esc:back  q:quit"
+		hint = "↑↓/pgup/pgdn:scroll  p:older  n:newer  esc:back  q:quit"
 	default:
-		hint = "1-5:tabs  q:quit"
+		hint = "1-4:tabs  q:quit"
 	}
 
 	status := ui.StyleStatusBar.Width(m.width).Render(hint)

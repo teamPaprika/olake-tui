@@ -25,15 +25,15 @@ func newTestModel() (Model, *service.MockService) {
 	}
 	mock.Jobs = []service.Job{
 		{
-			ID:        100,
-			Name:      "nightly-sync",
-			Frequency: "0 0 * * *",
-			Activate:  true,
-			Source:    service.JobConnector{ID: 1, Name: "pg-prod", Type: "postgres"},
+			ID:          100,
+			Name:        "nightly-sync",
+			Frequency:   "0 0 * * *",
+			Activate:    true,
+			Source:      service.JobConnector{ID: 1, Name: "pg-prod", Type: "postgres"},
 			Destination: service.JobConnector{ID: 10, Name: "s3-bucket", Type: "s3"},
 		},
 	}
-	return New(mock), mock
+	return New(mock, "test"), mock
 }
 
 // update applies a message to the model and returns the updated model + any command.

@@ -159,7 +159,7 @@ func (m DestinationsModel) View() string {
 			colName, name,
 			colType, d.Type,
 			colVersion, d.Version,
-			len(d.Jobs),
+			d.JobCount,
 		)
 		if i == m.cursor {
 			rows = append(rows, StyleSelected.Render("> "+row))

@@ -13,16 +13,20 @@ import (
 
 // JobLogsModel displays paginated logs for a job task.
 type JobLogsModel struct {
-	jobID    int
-	taskID   string
-	filePath string
-	logs     []service.LogEntry
-	vp       viewport.Model
-	loading  bool
-	err      string
-	spinner  spinner.Model
-	width    int
-	height   int
+	jobID        int
+	taskID       string
+	filePath     string
+	logs         []service.LogEntry
+	vp           viewport.Model
+	loading      bool
+	err          string
+	spinner      spinner.Model
+	width        int
+	height       int
+	olderCursor  int64
+	newerCursor  int64
+	hasMoreOlder bool
+	hasMoreNewer bool
 }
 
 // NewJobLogsModel creates a new log viewer.
@@ -46,22 +50,27 @@ func NewJobLogsModel(jobID int, taskID, filePath string, width, height int) JobL
 	}
 }
 
-// SetLogs populates the log viewer with entries.
-func (m *JobLogsModel) SetLogs(logs []service.LogEntry) {
-	m.logs = logs
+// ApplyResponse populates the log viewer with a service response.
+func (m *JobLogsModel) ApplyResponse(resp *service.TaskLogsResponse) {
+	if resp == nil {
+		return
+	}
+	m.logs = resp.Logs
+	m.olderCursor = resp.OlderCursor
+	m.newerCursor = resp.NewerCursor
+	m.hasMoreOlder = resp.HasMoreOlder
+	m.hasMoreNewer = resp.HasMoreNewer
 	m.loading = false
 	m.err = ""
 	m.refreshContent()
 }
 
-// AppendLogs adds more entries (for pagination).
-func (m *JobLogsModel) AppendLogs(logs []service.LogEntry, prepend bool) {
-	if prepend {
-		m.logs = append(logs, m.logs...)
-	} else {
-		m.logs = append(m.logs, logs...)
+// SetLoading toggles the loading spinner state.
+func (m *JobLogsModel) SetLoading(loading bool) {
+	m.loading = loading
+	if loading {
+		m.err = ""
 	}
-	m.refreshContent()
 }
 
 // SetError sets an error state.
@@ -77,6 +86,24 @@ func (m *JobLogsModel) SetSize(w, h int) {
 	m.vp.Width = w
 	m.vp.Height = h - 6
 }
+
+// JobID returns the associated job identifier.
+func (m JobLogsModel) JobID() int { return m.jobID }
+
+// TaskID returns the associated task identifier.
+func (m JobLogsModel) TaskID() string { return m.taskID }
+
+// FilePath returns the worker log file path.
+func (m JobLogsModel) FilePath() string { return m.filePath }
+
+// OlderCursor reports the cursor for fetching older logs.
+func (m JobLogsModel) OlderCursor() (int64, bool) { return m.olderCursor, m.hasMoreOlder }
+
+// NewerCursor reports the cursor for fetching newer logs.
+func (m JobLogsModel) NewerCursor() (int64, bool) { return m.newerCursor, m.hasMoreNewer }
+
+// IsLoading reports whether a pagination request is pending.
+func (m JobLogsModel) IsLoading() bool { return m.loading }
 
 func (m *JobLogsModel) refreshContent() {
 	var sb strings.Builder
@@ -123,7 +150,7 @@ func (m JobLogsModel) Update(msg tea.Msg) (JobLogsModel, tea.Cmd) {
 // View renders the log viewer.
 func (m JobLogsModel) View() string {
 	title := StyleTitle.Render(fmt.Sprintf("Logs — Job %d / Task %s", m.jobID, m.taskID))
-	hint := StyleHelp.Render("↑↓/pgup/pgdn: scroll  •  esc: back")
+	hint := StyleHelp.Render("↑↓/pgup/pgdn: scroll  •  p:older  •  n:newer  •  esc: back")
 
 	if m.loading {
 		return lipgloss.JoinVertical(lipgloss.Left, title, "", m.spinner.View()+" Loading logs...", "", hint)

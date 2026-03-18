@@ -105,30 +105,32 @@ type executionRequest struct {
 
 // Source represents a configured data source connector.
 type Source struct {
-	ID        int       `json:"id"`
-	Name      string    `json:"name"`
-	Type      string    `json:"type"`
-	Version   string    `json:"version"`
-	Config    string    `json:"config"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	CreatedBy string    `json:"created_by"`
-	UpdatedBy string    `json:"updated_by"`
+	ID        int         `json:"id"`
+	Name      string      `json:"name"`
+	Type      string      `json:"type"`
+	Version   string      `json:"version"`
+	Config    string      `json:"config"`
+	CreatedAt time.Time   `json:"created_at"`
+	UpdatedAt time.Time   `json:"updated_at"`
+	CreatedBy string      `json:"created_by"`
+	UpdatedBy string      `json:"updated_by"`
 	Jobs      []EntityJob `json:"jobs"`
+	JobCount  int         `json:"job_count"`
 }
 
 // Destination represents a configured data destination connector.
 type Destination struct {
-	ID        int       `json:"id"`
-	Name      string    `json:"name"`
-	Type      string    `json:"type"`
-	Version   string    `json:"version"`
-	Config    string    `json:"config"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	CreatedBy string    `json:"created_by"`
-	UpdatedBy string    `json:"updated_by"`
+	ID        int         `json:"id"`
+	Name      string      `json:"name"`
+	Type      string      `json:"type"`
+	Version   string      `json:"version"`
+	Config    string      `json:"config"`
+	CreatedAt time.Time   `json:"created_at"`
+	UpdatedAt time.Time   `json:"updated_at"`
+	CreatedBy string      `json:"created_by"`
+	UpdatedBy string      `json:"updated_by"`
 	Jobs      []EntityJob `json:"jobs"`
+	JobCount  int         `json:"job_count"`
 }
 
 // EntityJob is a job summary attached to a source or destination.
@@ -456,17 +458,18 @@ func (m *Manager) currentUserID() int {
 
 // ─── Sources ─────────────────────────────────────────────────────────────────
 
-// ListSources returns all sources for the project.
+// ListSources returns all sources for the project, including associated job counts.
 func (m *Manager) ListSources() ([]Source, error) {
 	q := fmt.Sprintf(`
 		SELECT s.id, s.name, s.type, s.version, s.config, s.created_at, s.updated_at,
-		       COALESCE(cu.username,'') AS created_by, COALESCE(uu.username,'') AS updated_by
+		       COALESCE(cu.username,'') AS created_by, COALESCE(uu.username,'') AS updated_by,
+		       (SELECT COUNT(*) FROM %s j WHERE j.source_id = s.id AND j.deleted_at IS NULL) AS job_count
 		FROM %s s
 		LEFT JOIN %s cu ON s.created_by_id = cu.id
 		LEFT JOIN %s uu ON s.updated_by_id = uu.id
 		WHERE s.project_id = $1 AND s.deleted_at IS NULL
 		ORDER BY s.updated_at DESC`,
-		m.tbl("source"), m.tbl("user"), m.tbl("user"))
+		m.tbl("job"), m.tbl("source"), m.tbl("user"), m.tbl("user"))
 
 	rows, err := m.db.QueryContext(context.Background(), q, m.projectID)
 	if err != nil {
@@ -479,7 +482,7 @@ func (m *Manager) ListSources() ([]Source, error) {
 		var s Source
 		var encCfg string
 		if err := rows.Scan(&s.ID, &s.Name, &s.Type, &s.Version, &encCfg,
-			&s.CreatedAt, &s.UpdatedAt, &s.CreatedBy, &s.UpdatedBy); err != nil {
+			&s.CreatedAt, &s.UpdatedAt, &s.CreatedBy, &s.UpdatedBy, &s.JobCount); err != nil {
 			return nil, fmt.Errorf("scan source: %w", err)
 		}
 		s.Config, err = m.decrypt(encCfg)
@@ -586,17 +589,18 @@ func (m *Manager) countJobsBySource(sourceID int) (int, error) {
 
 // ─── Destinations ─────────────────────────────────────────────────────────────
 
-// ListDestinations returns all destinations for the project.
+// ListDestinations returns all destinations for the project, including associated job counts.
 func (m *Manager) ListDestinations() ([]Destination, error) {
 	q := fmt.Sprintf(`
 		SELECT d.id, d.name, d.type, d.version, d.config, d.created_at, d.updated_at,
-		       COALESCE(cu.username,'') AS created_by, COALESCE(uu.username,'') AS updated_by
+		       COALESCE(cu.username,'') AS created_by, COALESCE(uu.username,'') AS updated_by,
+		       (SELECT COUNT(*) FROM %s j WHERE j.dest_id = d.id AND j.deleted_at IS NULL) AS job_count
 		FROM %s d
 		LEFT JOIN %s cu ON d.created_by_id = cu.id
 		LEFT JOIN %s uu ON d.updated_by_id = uu.id
 		WHERE d.project_id = $1 AND d.deleted_at IS NULL
 		ORDER BY d.updated_at DESC`,
-		m.tbl("destination"), m.tbl("user"), m.tbl("user"))
+		m.tbl("job"), m.tbl("destination"), m.tbl("user"), m.tbl("user"))
 
 	rows, err := m.db.QueryContext(context.Background(), q, m.projectID)
 	if err != nil {
@@ -609,7 +613,7 @@ func (m *Manager) ListDestinations() ([]Destination, error) {
 		var d Destination
 		var encCfg string
 		if err := rows.Scan(&d.ID, &d.Name, &d.Type, &d.Version, &encCfg,
-			&d.CreatedAt, &d.UpdatedAt, &d.CreatedBy, &d.UpdatedBy); err != nil {
+			&d.CreatedAt, &d.UpdatedAt, &d.CreatedBy, &d.UpdatedBy, &d.JobCount); err != nil {
 			return nil, fmt.Errorf("scan destination: %w", err)
 		}
 		d.Config, err = m.decrypt(encCfg)
@@ -924,17 +928,16 @@ func (m *Manager) ListJobTasks(jobID int) ([]JobTask, error) {
 	return tasks, nil
 }
 
-// GetTaskLogs returns paginated log entries for a job task.
-// For the direct service layer this is a stub — log files are written by the
-// Temporal worker and live on the worker host. The TUI shows a message to the user.
+// GetTaskLogs returns paginated log entries for a job task by reading the
+// worker log files written to the shared config volume.
 func (m *Manager) GetTaskLogs(jobID int, taskID string, filePath string, cursor int64, limit int, direction string) (*TaskLogsResponse, error) {
-	return &TaskLogsResponse{
-		Logs: []LogEntry{{
-			Level:   "info",
-			Time:    time.Now().Format(time.RFC3339),
-			Message: "Log streaming requires access to the Temporal worker host filesystem. Use the BFF API for remote log access.",
-		}},
-	}, nil
+	if _, err := m.GetJob(jobID); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(filePath) == "" {
+		return nil, fmt.Errorf("log file path is required")
+	}
+	return readTaskLogsFromDisk(filePath, cursor, limit, direction)
 }
 
 // GetSettings returns project-level settings.

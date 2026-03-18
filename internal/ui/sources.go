@@ -12,13 +12,13 @@ import (
 
 // SourcesModel shows the sources list.
 type SourcesModel struct {
-	sources  []service.Source
-	cursor   int
-	loading  bool
-	err      string
-	spinner  spinner.Model
-	width    int
-	height   int
+	sources []service.Source
+	cursor  int
+	loading bool
+	err     string
+	spinner spinner.Model
+	width   int
+	height  int
 }
 
 // NewSourcesModel creates a new sources list view.
@@ -160,7 +160,7 @@ func (m SourcesModel) View() string {
 			colName, name,
 			colType, s.Type,
 			colVersion, s.Version,
-			len(s.Jobs),
+			s.JobCount,
 		)
 		if i == m.cursor {
 			rows = append(rows, StyleSelected.Render("> "+row))
