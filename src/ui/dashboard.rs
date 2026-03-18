@@ -3,7 +3,7 @@ use ratatui::widgets::*;
 
 use crate::app::App;
 
-pub fn render(frame: &mut Frame, area: Rect, _app: &App) {
+pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -36,13 +36,26 @@ pub fn render(frame: &mut Frame, area: Rect, _app: &App) {
     );
     frame.render_widget(welcome, chunks[0]);
 
-    // Quick stats placeholder
+    // Count running jobs
+    let running_jobs = app
+        .jobs
+        .iter()
+        .filter(|j| j.last_run_state.to_lowercase() == "running")
+        .count();
+
+    // Pre-allocate strings so they live long enough
+    let sources_count = app.sources.len().to_string();
+    let destinations_count = app.destinations.len().to_string();
+    let jobs_count = app.jobs.len().to_string();
+    let running_count = running_jobs.to_string();
+
+    // Quick stats with real data
     let stats = Table::new(
         vec![
-            Row::new(vec!["Sources", "0"]),
-            Row::new(vec!["Destinations", "0"]),
-            Row::new(vec!["Jobs", "0"]),
-            Row::new(vec!["Running", "0"]),
+            Row::new(vec!["Sources", sources_count.as_str()]),
+            Row::new(vec!["Destinations", destinations_count.as_str()]),
+            Row::new(vec!["Jobs", jobs_count.as_str()]),
+            Row::new(vec!["Running", running_count.as_str()]),
         ],
         [Constraint::Length(20), Constraint::Length(10)],
     )

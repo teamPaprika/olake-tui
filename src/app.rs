@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 use crate::event::{self, TuiEvent};
 use crate::olake::OlakeClient;
+use crate::olake::types::{Entity, Job};
 use crate::ui;
 
 // ---------------------------------------------------------------------------
@@ -62,6 +63,12 @@ pub enum Action {
     LoadDestinations,
     /// Load all jobs from the API.
     LoadJobs,
+    /// Refresh data for the current tab.
+    RefreshCurrentTab,
+    /// Select next item in list.
+    SelectNext,
+    /// Select previous item in list.
+    SelectPrev,
     /// Create a new source (placeholder — details TBD).
     CreateSource,
     /// Test connection for a connector config (placeholder).
@@ -86,11 +93,11 @@ pub enum AppEvent {
     /// Login failed; provides an error message.
     AuthFailed { reason: String },
     /// Sources loaded from the API.
-    SourcesLoaded { count: usize },
+    SourcesLoaded(Vec<Entity>),
     /// Destinations loaded from the API.
-    DestinationsLoaded { count: usize },
+    DestinationsLoaded(Vec<Entity>),
     /// Jobs loaded from the API.
-    JobsLoaded { count: usize },
+    JobsLoaded(Vec<Job>),
     /// Connection test result.
     ConnectionTestResult { success: bool, message: String },
     /// A sync operation has been acknowledged by the server.
@@ -203,6 +210,16 @@ pub struct App {
     /// Success/info message (shown in status bar briefly).
     pub info_message: Option<String>,
 
+    /// Loaded data
+    pub sources: Vec<Entity>,
+    pub destinations: Vec<Entity>,
+    pub jobs: Vec<Job>,
+
+    /// Selected row indices
+    pub selected_source_idx: usize,
+    pub selected_dest_idx: usize,
+    pub selected_job_idx: usize,
+
     /// Loading state for various async operations.
     pub loading_sources: LoadingState,
     pub loading_destinations: LoadingState,
@@ -234,6 +251,12 @@ impl App {
             login_form: LoginForm::default(),
             error_message: None,
             info_message: None,
+            sources: Vec::new(),
+            destinations: Vec::new(),
+            jobs: Vec::new(),
+            selected_source_idx: 0,
+            selected_dest_idx: 0,
+            selected_job_idx: 0,
             loading_sources: LoadingState::default(),
             loading_destinations: LoadingState::default(),
             loading_jobs: LoadingState::default(),
@@ -384,24 +407,164 @@ impl App {
     fn handle_main_key(&mut self, key: crossterm::event::KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.running = false,
-            KeyCode::Char('1') => self.active_tab = Tab::Dashboard,
-            KeyCode::Char('2') => self.active_tab = Tab::Sources,
-            KeyCode::Char('3') => self.active_tab = Tab::Destinations,
-            KeyCode::Char('4') => self.active_tab = Tab::Jobs,
-            KeyCode::Tab => self.next_tab(),
-            KeyCode::BackTab => self.prev_tab(),
+            KeyCode::Char('1') => self.switch_to_tab(Tab::Dashboard),
+            KeyCode::Char('2') => self.switch_to_tab(Tab::Sources),
+            KeyCode::Char('3') => self.switch_to_tab(Tab::Destinations),
+            KeyCode::Char('4') => self.switch_to_tab(Tab::Jobs),
+            KeyCode::Tab => {
+                let idx = Tab::ALL.iter().position(|t| *t == self.active_tab).unwrap_or(0);
+                let new_tab = Tab::ALL[(idx + 1) % Tab::ALL.len()];
+                self.switch_to_tab(new_tab);
+            }
+            KeyCode::BackTab => {
+                let idx = Tab::ALL.iter().position(|t| *t == self.active_tab).unwrap_or(0);
+                let new_tab = Tab::ALL[(idx + Tab::ALL.len() - 1) % Tab::ALL.len()];
+                self.switch_to_tab(new_tab);
+            }
+            // List navigation
+            KeyCode::Char('j') | KeyCode::Down => self.select_next(),
+            KeyCode::Char('k') | KeyCode::Up => self.select_prev(),
+            // Refresh
+            KeyCode::Char('r') => self.refresh_current_tab(),
             _ => {}
         }
     }
 
-    fn next_tab(&mut self) {
-        let idx = Tab::ALL.iter().position(|t| *t == self.active_tab).unwrap_or(0);
-        self.active_tab = Tab::ALL[(idx + 1) % Tab::ALL.len()];
+    fn switch_to_tab(&mut self, tab: Tab) {
+        self.active_tab = tab;
+        // Auto-load data when switching to a data tab
+        match tab {
+            Tab::Sources => self.load_sources(),
+            Tab::Destinations => self.load_destinations(),
+            Tab::Jobs => self.load_jobs(),
+            Tab::Dashboard => {}
+        }
     }
 
-    fn prev_tab(&mut self) {
-        let idx = Tab::ALL.iter().position(|t| *t == self.active_tab).unwrap_or(0);
-        self.active_tab = Tab::ALL[(idx + Tab::ALL.len() - 1) % Tab::ALL.len()];
+    fn select_next(&mut self) {
+        match self.active_tab {
+            Tab::Sources => {
+                if !self.sources.is_empty() {
+                    self.selected_source_idx = (self.selected_source_idx + 1) % self.sources.len();
+                }
+            }
+            Tab::Destinations => {
+                if !self.destinations.is_empty() {
+                    self.selected_dest_idx = (self.selected_dest_idx + 1) % self.destinations.len();
+                }
+            }
+            Tab::Jobs => {
+                if !self.jobs.is_empty() {
+                    self.selected_job_idx = (self.selected_job_idx + 1) % self.jobs.len();
+                }
+            }
+            Tab::Dashboard => {}
+        }
+    }
+
+    fn select_prev(&mut self) {
+        match self.active_tab {
+            Tab::Sources => {
+                if !self.sources.is_empty() {
+                    self.selected_source_idx = self.selected_source_idx
+                        .saturating_sub(1)
+                        .min(self.sources.len() - 1);
+                    if self.selected_source_idx == 0 && self.sources.len() > 0 {
+                        // wrap around
+                        // actually saturating_sub already handles 0 case; keep 0
+                    }
+                }
+            }
+            Tab::Destinations => {
+                if !self.destinations.is_empty() {
+                    self.selected_dest_idx = if self.selected_dest_idx == 0 {
+                        self.destinations.len() - 1
+                    } else {
+                        self.selected_dest_idx - 1
+                    };
+                }
+            }
+            Tab::Jobs => {
+                if !self.jobs.is_empty() {
+                    self.selected_job_idx = if self.selected_job_idx == 0 {
+                        self.jobs.len() - 1
+                    } else {
+                        self.selected_job_idx - 1
+                    };
+                }
+            }
+            Tab::Dashboard => {}
+        }
+    }
+
+    fn refresh_current_tab(&mut self) {
+        match self.active_tab {
+            Tab::Sources => self.load_sources(),
+            Tab::Destinations => self.load_destinations(),
+            Tab::Jobs => self.load_jobs(),
+            Tab::Dashboard => {
+                self.load_sources();
+                self.load_destinations();
+                self.load_jobs();
+            }
+        }
+    }
+
+    fn load_sources(&mut self) {
+        if self.loading_sources.loading {
+            return;
+        }
+        self.loading_sources.start();
+        let client = self.client.clone();
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            match client.sources_list().await {
+                Ok(data) => {
+                    let _ = tx.send(AppEvent::SourcesLoaded(data));
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Error(format!("Failed to load sources: {}", e)));
+                }
+            }
+        });
+    }
+
+    fn load_destinations(&mut self) {
+        if self.loading_destinations.loading {
+            return;
+        }
+        self.loading_destinations.start();
+        let client = self.client.clone();
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            match client.destinations_list().await {
+                Ok(data) => {
+                    let _ = tx.send(AppEvent::DestinationsLoaded(data));
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Error(format!("Failed to load destinations: {}", e)));
+                }
+            }
+        });
+    }
+
+    fn load_jobs(&mut self) {
+        if self.loading_jobs.loading {
+            return;
+        }
+        self.loading_jobs.start();
+        let client = self.client.clone();
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            match client.jobs_list().await {
+                Ok(data) => {
+                    let _ = tx.send(AppEvent::JobsLoaded(data));
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Error(format!("Failed to load jobs: {}", e)));
+                }
+            }
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -421,16 +584,32 @@ impl App {
                 self.login_form.loading.stop();
                 self.login_form.error = Some(reason);
             }
-            AppEvent::SourcesLoaded { count } => {
+            AppEvent::SourcesLoaded(data) => {
                 self.loading_sources.stop();
+                let count = data.len();
+                self.sources = data;
+                // clamp selected index
+                if !self.sources.is_empty() && self.selected_source_idx >= self.sources.len() {
+                    self.selected_source_idx = self.sources.len() - 1;
+                }
                 self.info_message = Some(format!("Loaded {} source(s).", count));
             }
-            AppEvent::DestinationsLoaded { count } => {
+            AppEvent::DestinationsLoaded(data) => {
                 self.loading_destinations.stop();
+                let count = data.len();
+                self.destinations = data;
+                if !self.destinations.is_empty() && self.selected_dest_idx >= self.destinations.len() {
+                    self.selected_dest_idx = self.destinations.len() - 1;
+                }
                 self.info_message = Some(format!("Loaded {} destination(s).", count));
             }
-            AppEvent::JobsLoaded { count } => {
+            AppEvent::JobsLoaded(data) => {
                 self.loading_jobs.stop();
+                let count = data.len();
+                self.jobs = data;
+                if !self.jobs.is_empty() && self.selected_job_idx >= self.jobs.len() {
+                    self.selected_job_idx = self.jobs.len() - 1;
+                }
                 self.info_message = Some(format!("Loaded {} job(s).", count));
             }
             AppEvent::ConnectionTestResult { success, message } => {
