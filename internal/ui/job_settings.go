@@ -256,6 +256,11 @@ func (m *JobSettingsModel) SetSize(w, h int) {
 	m.height = h
 }
 
+// Job returns the job associated with this settings screen.
+func (m JobSettingsModel) Job() service.Job {
+	return m.job
+}
+
 // currentCron returns the cron string from current form state.
 func (m JobSettingsModel) currentCron() string {
 	return toCron(m.freqMode, m.numberInput.Value(), m.hourInput.Value(), m.minuteInput.Value(), m.cronInput.Value())

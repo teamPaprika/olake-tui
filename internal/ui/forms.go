@@ -67,6 +67,21 @@ func (m *FormModel) SetError(err string) {
 	m.err = err
 }
 
+// SubmitCmd validates the form and returns a submit tea.Cmd, or nil if validation fails.
+func (m *FormModel) SubmitCmd() tea.Cmd {
+	values := make(map[string]string, len(m.fields))
+	for i, f := range m.fields {
+		val := strings.TrimSpace(m.inputs[i].Value())
+		if f.Required && val == "" {
+			m.err = f.Label + " is required"
+			return nil
+		}
+		values[f.Label] = val
+	}
+	captured := values
+	return func() tea.Msg { return FormSubmitMsg{Values: captured} }
+}
+
 // Init implements tea.Model.
 func (m FormModel) Init() tea.Cmd {
 	return textinput.Blink

@@ -92,6 +92,37 @@ type msgSourceUpdated struct{ err error }
 type msgDestCreated struct{ err error }
 type msgDestUpdated struct{ err error }
 type msgTestSourceDone struct{ err error }
+type msgTestConnectionDone struct{ err error; logs []string }
+
+// modalContext tracks what the active modal should do on confirm/cancel/alt.
+type modalContext int
+
+const (
+	modalCtxNone modalContext = iota
+	modalCtxTestConnectionSave            // after success → save entity
+	modalCtxEntityCancelSource            // cancel source form
+	modalCtxEntityCancelDest              // cancel dest form
+	modalCtxEntityCancelJob               // cancel job wizard
+	modalCtxEntityCancelJobEdit           // cancel job edit
+	modalCtxEntitySavedSource             // source saved → nav
+	modalCtxEntitySavedDest               // dest saved → nav
+	modalCtxEntitySavedJob                // job saved → nav
+	modalCtxEntityEditSource              // edit source with jobs → confirm → save
+	modalCtxEntityEditDest                // edit dest with jobs → confirm → save
+	modalCtxDeleteSource                  // delete source (with jobs table)
+	modalCtxDeleteDest                    // delete dest (with jobs table)
+	modalCtxDeleteJob                     // delete job
+	modalCtxDeleteJobFromSettings         // delete job from settings → nav /jobs
+	modalCtxClearDestination              // clear destination first confirm
+	modalCtxClearData                     // clear destination second confirm (execute)
+	modalCtxSpecFailedSource              // retry spec fetch for source
+	modalCtxSpecFailedDest                // retry spec fetch for destination
+	modalCtxStreamDifference              // confirm save with stream diffs
+	modalCtxIngestionModeChange           // apply ingestion mode to all streams
+	modalCtxResetStreams                  // leave streams step
+	modalCtxStreamEditDisabled            // editing disabled info
+	modalCtxUpdates                       // updates info
+)
 
 // confirmContext identifies what action a confirmation dialog is for.
 type confirmContext int
@@ -138,6 +169,12 @@ type Model struct {
 
 	// Entity (source/dest) create/edit form
 	entityForm   *ui.EntityFormModel
+
+	// Modal overlay system (all 17 modals)
+	modalState   ui.ModalState
+	modalCtx     modalContext
+	modalID      int    // entity ID associated with the active modal action
+	modalPayload string // extra string payload (e.g. error message, job name)
 
 	// Data
 	jobList   []service.Job
@@ -421,23 +458,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case ui.JobSettingsClearDestMsg:
-		j := m.jobs.SelectedJob()
-		if j != nil {
-			return m.showConfirm(
-				"Clear Destination",
-				fmt.Sprintf("⚠  This will delete ALL data at the destination for job '%s'. This cannot be undone!", j.Name),
-				confirmClearDest, j.ID,
-			), nil
+		if m.jobSettings != nil {
+			j := m.jobSettings.Job()
+			m.modalCtx = modalCtxClearDestination
+			m.modalID = j.ID
+			m.modalPayload = j.Name
+			modal := ui.NewClearDestinationModal(j.Name)
+			cmd := m.modalState.Show(modal)
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			return m, tea.Batch(cmds...)
 		}
 
 	case ui.JobSettingsDeleteMsg:
-		j := m.jobs.SelectedJob()
-		if j != nil {
-			return m.showConfirm(
-				"Delete Job",
-				fmt.Sprintf("Delete job '%s'? This cannot be undone.", j.Name),
-				confirmDeleteJobFromSettings, j.ID,
-			), nil
+		if m.jobSettings != nil {
+			j := m.jobSettings.Job()
+			m.modalCtx = modalCtxDeleteJobFromSettings
+			m.modalID = j.ID
+			m.modalPayload = j.Name
+			modal := ui.NewDeleteJobModal(j.Name)
+			cmd := m.modalState.Show(modal)
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			return m, tea.Batch(cmds...)
 		}
 
 	case ui.JobDetailBackMsg:
@@ -480,46 +525,96 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleEntityFormSubmit(msg)
 
 	case ui.EntityFormCancelMsg:
-		return m.closeEntityForm(), nil
+		// Show EntityCancelModal instead of navigating directly
+		var ctx modalContext
+		if m.tab == TabSources {
+			ctx = modalCtxEntityCancelSource
+		} else {
+			ctx = modalCtxEntityCancelDest
+		}
+		return m.showEntityCancelModal(ctx)
 
 	case msgSourceCreated:
-		m.entityForm = nil
-		m.screen = ScreenSources
 		if msg.err != nil {
+			m.entityForm = nil
+			m.screen = ScreenSources
 			cmds = append(cmds, showToast("Create failed: "+msg.err.Error(), true))
 		} else {
 			m.sources.SetLoading(true)
-			cmds = append(cmds, m.loadSources(), showToast("Source created!", false))
+			cmds = append(cmds, m.loadSources())
+			// Show EntitySavedModal — on confirm navigate to sources, on alt create job
+			entityName := ""
+			if m.entityForm != nil {
+				entityName = m.entityForm.Name()
+			}
+			m.entityForm = nil
+			newM, cmd := m.showEntitySavedModal(modalCtxEntitySavedSource, entityName)
+			m = newM
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 		}
 
 	case msgSourceUpdated:
-		m.entityForm = nil
-		m.screen = ScreenSources
 		if msg.err != nil {
+			m.entityForm = nil
+			m.screen = ScreenSources
 			cmds = append(cmds, showToast("Update failed: "+msg.err.Error(), true))
 		} else {
 			m.sources.SetLoading(true)
-			cmds = append(cmds, m.loadSources(), showToast("Source updated!", false))
+			cmds = append(cmds, m.loadSources())
+			entityName := ""
+			if m.entityForm != nil {
+				entityName = m.entityForm.Name()
+			}
+			m.entityForm = nil
+			m.screen = ScreenSources
+			newM, cmd := m.showEntitySavedModal(modalCtxEntitySavedSource, entityName)
+			m = newM
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 		}
 
 	case msgDestCreated:
-		m.entityForm = nil
-		m.screen = ScreenDestinations
 		if msg.err != nil {
+			m.entityForm = nil
+			m.screen = ScreenDestinations
 			cmds = append(cmds, showToast("Create failed: "+msg.err.Error(), true))
 		} else {
 			m.destinations.SetLoading(true)
-			cmds = append(cmds, m.loadDests(), showToast("Destination created!", false))
+			cmds = append(cmds, m.loadDests())
+			entityName := ""
+			if m.entityForm != nil {
+				entityName = m.entityForm.Name()
+			}
+			m.entityForm = nil
+			newM, cmd := m.showEntitySavedModal(modalCtxEntitySavedDest, entityName)
+			m = newM
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 		}
 
 	case msgDestUpdated:
-		m.entityForm = nil
-		m.screen = ScreenDestinations
 		if msg.err != nil {
+			m.entityForm = nil
+			m.screen = ScreenDestinations
 			cmds = append(cmds, showToast("Update failed: "+msg.err.Error(), true))
 		} else {
 			m.destinations.SetLoading(true)
-			cmds = append(cmds, m.loadDests(), showToast("Destination updated!", false))
+			cmds = append(cmds, m.loadDests())
+			entityName := ""
+			if m.entityForm != nil {
+				entityName = m.entityForm.Name()
+			}
+			m.entityForm = nil
+			m.screen = ScreenDestinations
+			newM, cmd := m.showEntitySavedModal(modalCtxEntitySavedDest, entityName)
+			m = newM
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 		}
 
 	case msgTestSourceDone:
@@ -527,6 +622,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, showToast("Connection test failed: "+msg.err.Error(), true))
 		} else {
 			cmds = append(cmds, showToast("Connection test succeeded!", false))
+		}
+
+	// ---------- Test connection with modal ----------
+	case msgTestConnectionDone:
+		if msg.err != nil {
+			modal := ui.NewTestConnectionFailureModal(msg.err.Error(), msg.logs)
+			cmd := m.modalState.Show(modal)
+			m.modalCtx = modalCtxNone // failure — user decides next step
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		} else {
+			modal := ui.NewTestConnectionSuccessModal()
+			cmd := m.modalState.Show(modal)
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			// The success modal auto-dismisses; on dismiss we proceed (handled in modal tick)
+		}
+
+	// ---------- Modal tick (spinner / auto-dismiss) ----------
+	case ui.ModalTickMsg:
+		action, cmd := m.modalState.HandleTick(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		if action == ui.ModalActionDismiss {
+			// Auto-dismiss: proceed with whatever follow-up action was pending
+			return m.handleModalDismiss(cmds)
 		}
 
 	// ---------- Wizard messages ----------
@@ -541,13 +665,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case msgJobCreatedWizard:
-		m.wizard = nil
-		m.screen = ScreenJobs
 		if msg.err != nil {
+			m.wizard = nil
+			m.screen = ScreenJobs
 			cmds = append(cmds, showToast("Create job failed: "+msg.err.Error(), true))
 		} else {
 			m.jobs.SetLoading(true)
-			cmds = append(cmds, m.loadJobs(), showToast("Job created!", false))
+			cmds = append(cmds, m.loadJobs())
+			jobName := ""
+			if msg.job != nil {
+				jobName = msg.job.Name
+			}
+			m.wizard = nil
+			newM, cmd := m.showEntitySavedModal(modalCtxEntitySavedJob, jobName)
+			m = newM
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 		}
 
 	// ---------- Key events ----------
@@ -568,6 +702,25 @@ type confirmResult struct{ yes bool }
 
 // handleKey routes key events based on current screen.
 func (m Model) handleKey(msg tea.KeyMsg, cmds []tea.Cmd) (tea.Model, tea.Cmd) {
+	// Modal overlay intercepts all key events when active
+	if m.modalState.Active() {
+		action, cmd := m.modalState.HandleKey(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		switch action {
+		case ui.ModalActionConfirm:
+			return m.handleModalConfirm(cmds)
+		case ui.ModalActionCancel:
+			return m.handleModalCancel(cmds)
+		case ui.ModalActionAlt:
+			return m.handleModalAlt(cmds)
+		case ui.ModalActionDismiss:
+			return m.handleModalDismiss(cmds)
+		}
+		return m, tea.Batch(cmds...)
+	}
+
 	// Global quit
 	if msg.String() == "q" || msg.String() == "ctrl+c" {
 		if m.screen != ScreenLogin && m.screen != ScreenConfirm &&
@@ -712,7 +865,7 @@ func (m Model) handleTabKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "d":
 			if j := m.jobs.SelectedJob(); j != nil {
-				return m.showConfirm("Delete Job", fmt.Sprintf("Delete job '%s'? This cannot be undone.", j.Name), confirmDeleteJob, j.ID), nil
+				return m.showDeleteJobModal(j.Name, j.ID, false)
 			}
 		case "p":
 			if j := m.jobs.SelectedJob(); j != nil {
@@ -737,6 +890,8 @@ func (m Model) handleTabKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "n":
 			return m.openJobWizard()
+		case "u":
+			return m.showUpdatesModal()
 		default:
 			var cmd tea.Cmd
 			m.jobs, cmd = m.jobs.Update(msg)
@@ -766,7 +921,14 @@ func (m Model) handleTabKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "d":
 			if s := m.sources.SelectedSource(); s != nil {
-				return m.showConfirm("Delete Source", fmt.Sprintf("Delete source '%s'?", s.Name), confirmDeleteSource, s.ID), nil
+				// Use the new DeleteModal with job names (jobs list may be empty if not loaded)
+				var jobNames []string
+				for _, j := range m.jobList {
+					if j.Source.ID == s.ID {
+						jobNames = append(jobNames, j.Name)
+					}
+				}
+				return m.showDeleteEntityModal(s.Name, "source", jobNames, s.ID, true)
 			}
 		default:
 			var cmd tea.Cmd
@@ -792,7 +954,13 @@ func (m Model) handleTabKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "d":
 			if d := m.destinations.SelectedDestination(); d != nil {
-				return m.showConfirm("Delete Destination", fmt.Sprintf("Delete destination '%s'?", d.Name), confirmDeleteDest, d.ID), nil
+				var jobNames []string
+				for _, j := range m.jobList {
+					if j.Destination.ID == d.ID {
+						jobNames = append(jobNames, j.Name)
+					}
+				}
+				return m.showDeleteEntityModal(d.Name, "destination", jobNames, d.ID, false)
 			}
 		default:
 			var cmd tea.Cmd
@@ -854,6 +1022,330 @@ func (m *Model) handleConfirmResult(yes bool) tea.Cmd {
 	return nil
 }
 
+// ─── Modal handlers ───────────────────────────────────────────────────────────
+
+// showModal sets the active modal and returns the model + optional tick cmd.
+func (m Model) showModal(modal ui.Modal, ctx modalContext, id int, payload string) (Model, tea.Cmd) {
+	m.modalCtx = ctx
+	m.modalID = id
+	m.modalPayload = payload
+	cmd := m.modalState.Show(modal)
+	return m, cmd
+}
+
+// handleModalConfirm is called when the user confirms in the active modal.
+func (m Model) handleModalConfirm(cmds []tea.Cmd) (tea.Model, tea.Cmd) {
+	ctx := m.modalCtx
+	id := m.modalID
+	payload := m.modalPayload
+	m.modalState.Dismiss()
+
+	switch ctx {
+	// ── Entity cancel → user chose "Don't Cancel" (stay on form) ──────────
+	case modalCtxEntityCancelSource, modalCtxEntityCancelDest,
+		modalCtxEntityCancelJob, modalCtxEntityCancelJobEdit:
+		// Do nothing — the user wants to stay
+		return m, tea.Batch(cmds...)
+
+	// ── Entity saved → primary nav ─────────────────────────────────────────
+	case modalCtxEntitySavedSource:
+		m.screen = ScreenSources
+		m.sources.SetLoading(true)
+		cmds = append(cmds, m.loadSources())
+
+	case modalCtxEntitySavedDest:
+		m.screen = ScreenDestinations
+		m.destinations.SetLoading(true)
+		cmds = append(cmds, m.loadDests())
+
+	case modalCtxEntitySavedJob:
+		m.wizard = nil
+		m.screen = ScreenJobs
+		m.jobs.SetLoading(true)
+		cmds = append(cmds, m.loadJobs())
+
+	// ── Entity edit with active jobs → run test + save ─────────────────────
+	case modalCtxEntityEditSource:
+		// Proceed with saving the source
+		if m.entityForm != nil {
+			m.entityForm.SetTriggerSubmit(true)
+		}
+
+	case modalCtxEntityEditDest:
+		if m.entityForm != nil {
+			m.entityForm.SetTriggerSubmit(true)
+		}
+
+	// ── Delete source / dest ───────────────────────────────────────────────
+	case modalCtxDeleteSource:
+		svc := m.svc
+		cmds = append(cmds, func() tea.Msg {
+			err := svc.DeleteSource(id)
+			return msgSourceDeleted{err: err}
+		})
+
+	case modalCtxDeleteDest:
+		svc := m.svc
+		cmds = append(cmds, func() tea.Msg {
+			err := svc.DeleteDestination(id)
+			return msgDestDeleted{err: err}
+		})
+
+	// ── Delete job ─────────────────────────────────────────────────────────
+	case modalCtxDeleteJob:
+		svc := m.svc
+		cmds = append(cmds, func() tea.Msg {
+			err := svc.DeleteJob(id)
+			return msgJobDeleted{err: err}
+		})
+
+	case modalCtxDeleteJobFromSettings:
+		m.jobSettings = nil
+		m.screen = ScreenJobs
+		svc := m.svc
+		cmds = append(cmds, func() tea.Msg {
+			err := svc.DeleteJob(id)
+			return msgJobDeleted{err: err}
+		})
+
+	// ── Clear destination — first confirm → show second confirm ────────────
+	case modalCtxClearDestination:
+		modal := ui.NewClearDataModal()
+		m.modalCtx = modalCtxClearData
+		m.modalID = id
+		m.modalPayload = payload
+		cmd := m.modalState.Show(modal)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
+
+	// ── Clear destination — second confirm → execute ───────────────────────
+	case modalCtxClearData:
+		svc := m.svc
+		cmds = append(cmds, func() tea.Msg {
+			err := svc.ClearDestination(id)
+			return msgClearDestDone{err: err}
+		})
+
+	// ── Stream difference → save job ───────────────────────────────────────
+	case modalCtxStreamDifference:
+		// Continue wizard job creation/update flow
+		if m.wizard != nil {
+			wzd := *m.wizard
+			jobName := wzd.JobName()
+			srcID := wzd.SelectedSourceID()
+			dstID := wzd.SelectedDestID()
+			configs := wzd.SelectedStreamConfigs()
+			svc := m.svc
+			cmds = append(cmds, func() tea.Msg {
+				job, err := svc.CreateJob(jobName, srcID, dstID, "", configs)
+				return msgJobCreatedWizard{job: job, err: err}
+			})
+		}
+
+	// ── Ingestion mode change → apply ──────────────────────────────────────
+	case modalCtxIngestionModeChange:
+		// Nothing to do from app level — the wizard/streams handles it internally
+		// The payload contains the mode to apply; streamsModel handles it
+		_ = payload
+
+	// ── Reset streams → leave step ─────────────────────────────────────────
+	case modalCtxResetStreams:
+		// Leave wizard
+		m.wizard = nil
+		m.screen = ScreenJobs
+
+	// ── Spec failed → try again ────────────────────────────────────────────
+	case modalCtxSpecFailedSource, modalCtxSpecFailedDest:
+		// Retry entity form spec (just show a toast for now)
+		cmds = append(cmds, showToast("Retrying spec fetch…", false))
+
+	// ── Updates modal → closed ─────────────────────────────────────────────
+	case modalCtxUpdates:
+		// nothing
+
+	// ── Stream edit disabled ───────────────────────────────────────────────
+	case modalCtxStreamEditDisabled:
+		m.screen = ScreenJobs
+		m.jobSettings = nil
+	}
+
+	return m, tea.Batch(cmds...)
+}
+
+// handleModalCancel is called when the user cancels/closes the active modal.
+func (m Model) handleModalCancel(cmds []tea.Cmd) (tea.Model, tea.Cmd) {
+	ctx := m.modalCtx
+	m.modalState.Dismiss()
+
+	switch ctx {
+	// ── Entity cancel → user confirmed cancel → navigate away ─────────────
+	case modalCtxEntityCancelSource:
+		m.entityForm = nil
+		m.screen = ScreenSources
+
+	case modalCtxEntityCancelDest:
+		m.entityForm = nil
+		m.screen = ScreenDestinations
+
+	case modalCtxEntityCancelJob, modalCtxEntityCancelJobEdit:
+		m.wizard = nil
+		m.screen = ScreenJobs
+
+	// ── Test connection failure → "Back" → navigate to list ───────────────
+	case modalCtxTestConnectionSave:
+		// "Back" on failure modal → go back to entity form (stay on form)
+		// entityForm is still set, just dismiss the modal
+		_ = ctx
+
+	// ── All other modals — just close ─────────────────────────────────────
+	default:
+		// No navigation
+	}
+
+	return m, tea.Batch(cmds...)
+}
+
+// handleModalAlt handles the third action (e.g. "Edit" on failure modal, "Create a Job →" on saved modal).
+func (m Model) handleModalAlt(cmds []tea.Cmd) (tea.Model, tea.Cmd) {
+	ctx := m.modalCtx
+	m.modalState.Dismiss()
+
+	switch ctx {
+	// ── Entity saved → "Create a job →" ───────────────────────────────────
+	case modalCtxEntitySavedSource, modalCtxEntitySavedDest:
+		return m.openJobWizard()
+
+	// ── Test connection failure → "Edit" (stay on form) ───────────────────
+	case modalCtxTestConnectionSave:
+		// Stay on entity form
+		_ = ctx
+	}
+
+	return m, tea.Batch(cmds...)
+}
+
+// handleModalDismiss is called when a modal auto-dismisses (e.g. success after 1s).
+func (m Model) handleModalDismiss(cmds []tea.Cmd) (tea.Model, tea.Cmd) {
+	ctx := m.modalCtx
+	m.modalState.Dismiss()
+
+	switch ctx {
+	case modalCtxTestConnectionSave:
+		// Connection success auto-dismissed — proceed with save
+		if m.entityForm != nil {
+			// Submit the entity form
+			if cmd := m.entityForm.SubmitCmd(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
+	}
+
+	return m, tea.Batch(cmds...)
+}
+
+// showDeleteJobModal shows the delete job modal.
+func (m Model) showDeleteJobModal(jobName string, jobID int, fromSettings bool) (Model, tea.Cmd) {
+	ctx := modalCtxDeleteJob
+	if fromSettings {
+		ctx = modalCtxDeleteJobFromSettings
+	}
+	modal := ui.NewDeleteJobModal(jobName)
+	return m.showModal(modal, ctx, jobID, jobName)
+}
+
+// showDeleteEntityModal shows the delete source/dest modal.
+func (m Model) showDeleteEntityModal(entityName, entityKind string, jobNames []string, entityID int, isSource bool) (Model, tea.Cmd) {
+	ctx := modalCtxDeleteSource
+	if !isSource {
+		ctx = modalCtxDeleteDest
+	}
+	modal := ui.NewDeleteModal(entityName, entityKind, jobNames)
+	return m.showModal(modal, ctx, entityID, entityName)
+}
+
+// showEntityCancelModal shows the "discard changes?" modal.
+func (m Model) showEntityCancelModal(ctx modalContext) (Model, tea.Cmd) {
+	var cancelCtx ui.EntityCancelContext
+	switch ctx {
+	case modalCtxEntityCancelSource:
+		cancelCtx = ui.EntityCancelSource
+	case modalCtxEntityCancelDest:
+		cancelCtx = ui.EntityCancelDest
+	case modalCtxEntityCancelJob:
+		cancelCtx = ui.EntityCancelJob
+	case modalCtxEntityCancelJobEdit:
+		cancelCtx = ui.EntityCancelJobEdit
+	}
+	modal := ui.NewEntityCancelModal(cancelCtx)
+	return m.showModal(modal, ctx, 0, "")
+}
+
+// showEntitySavedModal shows the "saved successfully" modal.
+func (m Model) showEntitySavedModal(ctx modalContext, name string) (Model, tea.Cmd) {
+	var savedCtx ui.EntitySavedContext
+	switch ctx {
+	case modalCtxEntitySavedSource:
+		savedCtx = ui.EntitySavedSource
+	case modalCtxEntitySavedDest:
+		savedCtx = ui.EntitySavedDestination
+	case modalCtxEntitySavedJob:
+		savedCtx = ui.EntitySavedJob
+	}
+	modal := ui.NewEntitySavedModal(savedCtx, name)
+	return m.showModal(modal, ctx, 0, name)
+}
+
+// showTestConnectionModal shows the spinner while testing connection.
+func (m Model) showTestConnectionModal() (Model, tea.Cmd) {
+	modal := ui.NewTestConnectionModal()
+	m.modalCtx = modalCtxTestConnectionSave
+	cmd := m.modalState.Show(modal)
+	return m, cmd
+}
+
+// showUpdatesModal shows the OLake updates modal.
+func (m Model) showUpdatesModal() (Model, tea.Cmd) {
+	// Placeholder categories — in a real implementation these come from an API
+	categories := []ui.UpdateCategory{
+		{
+			Name:   "Features",
+			HasNew: false,
+		},
+		{
+			Name:   "OLake UI and Worker",
+			HasNew: false,
+		},
+		{
+			Name:   "OLake",
+			HasNew: false,
+		},
+		{
+			Name:   "OLake Helm",
+			HasNew: false,
+		},
+	}
+	modal := ui.NewUpdatesModal(categories)
+	return m.showModal(modal, modalCtxUpdates, 0, "")
+}
+
+// showStreamEditDisabledModal shows the "editing disabled" modal.
+func (m Model) showStreamEditDisabledModal(fromJobSettings bool) (Model, tea.Cmd) {
+	from := ui.StreamEditDisabledFromJobEdit
+	if fromJobSettings {
+		from = ui.StreamEditDisabledFromJobSettings
+	}
+	modal := ui.NewStreamEditDisabledModal(from)
+	return m.showModal(modal, modalCtxStreamEditDisabled, 0, "")
+}
+
+// showResetStreamsModal shows the "leave streams?" modal.
+func (m Model) showResetStreamsModal() (Model, tea.Cmd) {
+	modal := ui.NewResetStreamsModal()
+	return m.showModal(modal, modalCtxResetStreams, 0, "")
+}
+
 // openJobWizard starts the job creation wizard.
 func (m Model) openJobWizard() (Model, tea.Cmd) {
 	wzd := ui.NewJobWizardModel(m.srcList, m.dstList, m.width, m.height)
@@ -875,9 +1367,8 @@ func (m Model) openJobWizard() (Model, tea.Cmd) {
 func (m Model) handleWizardMsg(msg ui.WizardMsg) (tea.Model, tea.Cmd) {
 	switch msg.Action {
 	case ui.WizardActionCancel:
-		m.wizard = nil
-		m.screen = ScreenJobs
-		return m, nil
+		// Show cancel confirmation modal
+		return m.showEntityCancelModal(modalCtxEntityCancelJob)
 
 	case ui.WizardActionDiscover:
 		srcID := msg.SourceID
@@ -1198,6 +1689,11 @@ func (m Model) View() string {
 		return m.confirm.View(m.width, m.height)
 	}
 
+	// Render modal overlay on top of anything else (if active)
+	if m.modalState.Active() {
+		return m.modalState.View(m.width, m.height)
+	}
+
 	// Full-screen sub-screens (no tab bar)
 	if m.screen == ScreenJobDetail && m.jobDetail != nil {
 		header := m.renderHeader()
@@ -1321,7 +1817,7 @@ func (m Model) renderStatusBar() string {
 	var hint string
 	switch m.screen {
 	case ScreenJobs:
-		hint = "1-5:tabs  n:new  Enter:detail  S:settings  s:sync  c:cancel  l:logs  p:pause  d:delete  r:refresh  q:quit"
+		hint = "1-5:tabs  n:new  Enter:detail  S:settings  s:sync  c:cancel  l:logs  p:pause  d:delete  u:updates  r:refresh  q:quit"
 	case ScreenJobDetail:
 		hint = "↑↓/j/k:navigate  enter/l:logs  s:sync  c:cancel  esc:back"
 	case ScreenJobSettings:

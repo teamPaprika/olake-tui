@@ -134,6 +134,28 @@ func (m *EntityFormModel) SetSize(w, h int) {
 	m.height = h
 }
 
+// Name returns the current value of the name input.
+func (m EntityFormModel) Name() string {
+	return strings.TrimSpace(m.nameInput.Value())
+}
+
+// SetTriggerSubmit signals the form to submit on next update cycle.
+// This is a no-op placeholder — actual submission flows through the form's
+// own submit mechanism. Kept for future use.
+func (m *EntityFormModel) SetTriggerSubmit(_ bool) {}
+
+// SubmitCmd attempts to trigger form submission and returns the resulting Cmd.
+// If the form is on the connection step and has a valid connForm, it fires the
+// submit. Otherwise returns nil.
+func (m *EntityFormModel) SubmitCmd() tea.Cmd {
+	if m.step == entityFormStepConnection && m.connForm != nil {
+		if cmd := m.connForm.SubmitCmd(); cmd != nil {
+			return cmd
+		}
+	}
+	return nil
+}
+
 // Init implements tea.Model.
 func (m EntityFormModel) Init() tea.Cmd {
 	return textinput.Blink
