@@ -102,7 +102,7 @@ const (
 
 // Model is the root Bubble Tea model.
 type Model struct {
-	svc     *service.Manager
+	svc     service.Service
 	keys    KeyMap
 	screen  Screen
 	tab     Tab
@@ -147,7 +147,7 @@ type Model struct {
 }
 
 // New creates the root application model.
-func New(svc *service.Manager) Model {
+func New(svc service.Service) Model {
 	return Model{
 		svc:          svc,
 		keys:         DefaultKeyMap(),

@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -180,6 +181,9 @@ type Manager struct {
 	projectID     string
 	runMode       string
 	encryptionKey string // raw key (env var value); empty = no encryption
+
+	// authMu protects the auth fields below, which may be written from goroutines.
+	authMu        sync.RWMutex
 	username      string
 	userID        int
 	authenticated bool
@@ -311,8 +315,10 @@ func (m *Manager) decrypt(encryptedText string) (string, error) {
 
 	var b64 string
 	if err := json.Unmarshal([]byte(encryptedText), &b64); err != nil {
-		// Not JSON-quoted → stored as plain text (no encryption when written)
-		return encryptedText, nil
+		// Failed to unmarshal as JSON-quoted string: data is either corrupted or
+		// was stored without encryption. Return an error rather than silently
+		// handing back raw ciphertext, which would appear as garbage config.
+		return "", fmt.Errorf("decrypt: failed to parse encrypted data (corrupted or wrong key): %w", err)
 	}
 	data, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
@@ -354,20 +360,32 @@ func (m *Manager) Login(username, password string) error {
 	if err := bcrypt.CompareHashAndPassword([]byte(hashedPwd), []byte(password)); err != nil {
 		return fmt.Errorf("invalid credentials")
 	}
+	m.authMu.Lock()
 	m.authenticated = true
 	m.username = username
 	m.userID = id
+	m.authMu.Unlock()
 	return nil
 }
 
 // IsAuthenticated returns true after a successful Login call.
-func (m *Manager) IsAuthenticated() bool { return m.authenticated }
+func (m *Manager) IsAuthenticated() bool {
+	m.authMu.RLock()
+	defer m.authMu.RUnlock()
+	return m.authenticated
+}
 
 // Username returns the logged-in username.
-func (m *Manager) Username() string { return m.username }
+func (m *Manager) Username() string {
+	m.authMu.RLock()
+	defer m.authMu.RUnlock()
+	return m.username
+}
 
 // CheckAuth is a no-op for the direct service layer (always returns nil when authenticated).
 func (m *Manager) CheckAuth() error {
+	m.authMu.RLock()
+	defer m.authMu.RUnlock()
 	if !m.authenticated {
 		return fmt.Errorf("not authenticated")
 	}
@@ -477,7 +495,9 @@ func (m *Manager) UpdateSource(id int, s EntityBase) (*Source, error) {
 	return m.GetSource(id)
 }
 
-// DeleteSource deletes a source by ID.
+// DeleteSource soft-deletes a source by ID (sets deleted_at = NOW()).
+// This matches the BFF's Beego ORM soft-delete behavior so that audit trails
+// are preserved and BFF users can still see historical data.
 func (m *Manager) DeleteSource(id int) error {
 	// Check no jobs reference this source
 	count, err := m.countJobsBySource(id)
@@ -487,8 +507,11 @@ func (m *Manager) DeleteSource(id int) error {
 	if count > 0 {
 		return fmt.Errorf("source is used by %d job(s); delete those jobs first", count)
 	}
-	q := fmt.Sprintf(`DELETE FROM %s WHERE id=$1`, m.tbl("source"))
-	_, err = m.db.ExecContext(context.Background(), q, id)
+	q := fmt.Sprintf(`UPDATE %s SET deleted_at=NOW(), updated_at=NOW(), updated_by_id=$2 WHERE id=$1 AND deleted_at IS NULL`, m.tbl("source"))
+	m.authMu.RLock()
+	uid := m.userID
+	m.authMu.RUnlock()
+	_, err = m.db.ExecContext(context.Background(), q, id, uid)
 	return err
 }
 
@@ -602,7 +625,8 @@ func (m *Manager) UpdateDestination(id int, d EntityBase) (*EntityBase, error) {
 	return &d, nil
 }
 
-// DeleteDestination deletes a destination by ID.
+// DeleteDestination soft-deletes a destination by ID (sets deleted_at = NOW()).
+// Matches BFF Beego ORM soft-delete behavior.
 func (m *Manager) DeleteDestination(id int) error {
 	count, err := m.countJobsByDest(id)
 	if err != nil {
@@ -611,8 +635,11 @@ func (m *Manager) DeleteDestination(id int) error {
 	if count > 0 {
 		return fmt.Errorf("destination is used by %d job(s); delete those jobs first", count)
 	}
-	q := fmt.Sprintf(`DELETE FROM %s WHERE id=$1`, m.tbl("destination"))
-	_, err = m.db.ExecContext(context.Background(), q, id)
+	q := fmt.Sprintf(`UPDATE %s SET deleted_at=NOW(), updated_at=NOW(), updated_by_id=$2 WHERE id=$1 AND deleted_at IS NULL`, m.tbl("destination"))
+	m.authMu.RLock()
+	uid := m.userID
+	m.authMu.RUnlock()
+	_, err = m.db.ExecContext(context.Background(), q, id, uid)
 	return err
 }
 
@@ -752,8 +779,12 @@ func (m *Manager) DeleteJob(id int) error {
 		_ = handle.Delete(context.Background()) // ignore error if not found
 	}
 
-	q := fmt.Sprintf(`DELETE FROM %s WHERE id=$1`, m.tbl("job"))
-	_, err = m.db.ExecContext(context.Background(), q, id)
+	// Soft-delete the job record to match BFF behavior (sets deleted_at = NOW()).
+	q := fmt.Sprintf(`UPDATE %s SET deleted_at=NOW(), updated_at=NOW(), updated_by_id=$2 WHERE id=$1`, m.tbl("job"))
+	m.authMu.RLock()
+	uid := m.userID
+	m.authMu.RUnlock()
+	_, err = m.db.ExecContext(context.Background(), q, id, uid)
 	_ = job // referenced above
 	return err
 }
@@ -878,19 +909,26 @@ func (m *Manager) UpdateJobMeta(id int, name, frequency string) error {
 	return err
 }
 
-// ClearDestination triggers a clear-destination sync for a job via Temporal schedule.
-// It uses the same schedule mechanism as TriggerSync but sets the job_type to "clear".
-// In the direct service layer this is equivalent to triggering a special workflow.
+// ClearDestination triggers a clear-destination workflow for a job.
+//
+// The BFF uses a dedicated Temporal workflow that:
+//  1. Pauses the normal sync schedule.
+//  2. Updates the schedule to use a "clear" execution request (job_type=clear).
+//  3. Triggers the updated schedule.
+//  4. After completion, the worker restores the normal sync schedule.
+//
+// In the direct-DB mode the TUI cannot replicate this multi-step orchestration
+// without the full BFF service layer. We therefore return a clear error so the
+// user is not misled into thinking a normal sync has cleared their destination.
+// If you need clear-destination support, use the BFF API endpoint:
+//   POST /api/v1/project/{projectid}/jobs/{id}/clear-destination
 func (m *Manager) ClearDestination(id int) error {
-	if m.temporal == nil {
-		return fmt.Errorf("temporal client not connected — set TEMPORAL_ADDRESS")
-	}
-	// Trigger the existing schedule — the scheduler will use last_run_type "clear"
-	// when job_type overrides are configured on the Temporal schedule.
-	// For simplicity we trigger a normal sync here; the BFF API has a dedicated endpoint.
-	_, scheduleID := m.workflowAndScheduleID(m.projectID, id)
-	handle := m.temporal.ScheduleClient().GetHandle(context.Background(), scheduleID)
-	return handle.Trigger(context.Background(), client.ScheduleTriggerOptions{})
+	return fmt.Errorf(
+		"clear-destination requires the BFF service layer and cannot be " +
+			"executed from the direct-DB mode. Use the BFF API endpoint instead: " +
+			"POST /api/v1/project/{projectid}/jobs/%d/clear-destination",
+		id,
+	)
 }
 
 // TestSource is not implemented in the direct service layer (requires Temporal worker).

@@ -1,1 +1,6 @@
-/target
+bin/
+*.exe
+.env
+olake-tui
+_olake-ui-ref/
+src-rust-archive/
