@@ -1,43 +1,51 @@
-// Package service provides an HTTP client wrapper for the OLake BFF server.
+// Package service provides a direct database + Temporal client for the OLake TUI.
 //
-// Architecture note (see docs/05-go-pivot-notes.md):
-// The OLake BFF server is the correct integration point. It handles:
-//   - Temporal workflow orchestration (discover, check, spec, sync)
-//   - Config encryption/decryption (AES-256-GCM or AWS KMS)
-//   - Docker image version lookups
-//   - PostgreSQL-backed sessions
+// Architecture (see docs/05-go-pivot-notes.md):
 //
-// Direct import of github.com/datazip-inc/olake-ui/server packages was investigated
-// but deferred because:
-//   1. The server uses Beego framework with global ORM registration (init() side effects)
-//   2. Temporal client init panics without TEMPORAL_ADDRESS env var
-//   3. Session management is tightly coupled to Beego's HTTP server
+// Direct import of github.com/datazip-inc/olake-ui/server packages is not feasible
+// because the BFF server uses the Beego framework, whose constants.Init() calls
+// checkForRequiredVariables() which panics at import time if OLAKE_POSTGRES_* env vars
+// are not set. The BFF also uses web.AppConfig throughout its service layer.
 //
-// Therefore, the TUI talks to the BFF server via HTTP (same as the web frontend).
-// When --api-url is provided, all operations go through the BFF REST API.
+// This package is a "forked service layer":
+//   - Uses standard database/sql (lib/pq driver) instead of Beego ORM
+//   - Uses go.temporal.io/sdk/client directly
+//   - Implements the same AES-256-GCM encryption/decryption used by the BFF
+//   - Matches the same DB schema and table-naming convention
+//   - No Beego dependency whatsoever
+//
+// DB table names match the BFF's "dev" run mode: olake-dev-<entity>.
+// Pass --run-mode=<mode> to override (dev/prod/staging).
 package service
 
 import (
-	"bytes"
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"net/http"
-	"net/http/cookiejar"
+	"strings"
 	"time"
+
+	_ "github.com/lib/pq"
+	"go.temporal.io/api/workflowservice/v1"
+	"go.temporal.io/sdk/client"
+	"golang.org/x/crypto/bcrypt"
 )
 
 const (
-	DefaultProjectID = "123"
-	DefaultAPIURL    = "http://localhost:8000"
+	DefaultProjectID    = "123"
+	DefaultTemporalHost = "localhost:7233"
+	DefaultRunMode      = "dev"
 )
 
-// APIResponse is the standard BFF response envelope.
-type APIResponse[T any] struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
-	Data    T      `json:"data"`
-}
+// ─── Domain types (kept identical to the HTTP version) ─────────────────────
 
 // Source represents a configured data source connector.
 type Source struct {
@@ -83,20 +91,20 @@ type EntityJob struct {
 
 // Job represents a sync job combining a source, destination, and schedule.
 type Job struct {
-	ID               int             `json:"id"`
-	Name             string          `json:"name"`
-	Source           JobConnector    `json:"source"`
-	Destination      JobConnector    `json:"destination"`
-	StreamsConfig    string          `json:"streams_config"`
-	Frequency        string          `json:"frequency"`
-	LastRunType      string          `json:"last_run_type"`
-	LastRunState     string          `json:"last_run_state"`
-	LastRunTime      string          `json:"last_run_time"`
-	CreatedAt        time.Time       `json:"created_at"`
-	UpdatedAt        time.Time       `json:"updated_at"`
-	CreatedBy        string          `json:"created_by"`
-	UpdatedBy        string          `json:"updated_by"`
-	Activate         bool            `json:"activate"`
+	ID               int               `json:"id"`
+	Name             string            `json:"name"`
+	Source           JobConnector      `json:"source"`
+	Destination      JobConnector      `json:"destination"`
+	StreamsConfig    string            `json:"streams_config"`
+	Frequency        string            `json:"frequency"`
+	LastRunType      string            `json:"last_run_type"`
+	LastRunState     string            `json:"last_run_state"`
+	LastRunTime      string            `json:"last_run_time"`
+	CreatedAt        time.Time         `json:"created_at"`
+	UpdatedAt        time.Time         `json:"updated_at"`
+	CreatedBy        string            `json:"created_by"`
+	UpdatedBy        string            `json:"updated_by"`
+	Activate         bool              `json:"activate"`
 	AdvancedSettings *AdvancedSettings `json:"advanced_settings"`
 }
 
@@ -132,11 +140,11 @@ type LogEntry struct {
 
 // TaskLogsResponse is the paginated log response.
 type TaskLogsResponse struct {
-	Logs          []LogEntry `json:"logs"`
-	OlderCursor   int64      `json:"older_cursor"`
-	NewerCursor   int64      `json:"newer_cursor"`
-	HasMoreOlder  bool       `json:"has_more_older"`
-	HasMoreNewer  bool       `json:"has_more_newer"`
+	Logs         []LogEntry `json:"logs"`
+	OlderCursor  int64      `json:"older_cursor"`
+	NewerCursor  int64      `json:"newer_cursor"`
+	HasMoreOlder bool       `json:"has_more_older"`
+	HasMoreNewer bool       `json:"has_more_newer"`
 }
 
 // TestConnectionResult is the result of a connection test.
@@ -163,300 +171,715 @@ type EntityBase struct {
 	Config  string `json:"config"`
 }
 
-// Manager is the service layer that communicates with the OLake BFF server.
+// ─── Manager ────────────────────────────────────────────────────────────────
+
+// Manager is the TUI service layer that talks directly to PostgreSQL and Temporal.
 type Manager struct {
-	baseURL   string
-	projectID string
-	client    *http.Client
-	token     string
-	username  string
+	db            *sql.DB
+	temporal      client.Client
+	projectID     string
+	runMode       string
+	encryptionKey string // raw key (env var value); empty = no encryption
+	username      string
+	userID        int
+	authenticated bool
 }
 
-// New creates a Manager pointing at the given BFF URL.
-func New(apiURL string) *Manager {
-	jar, _ := cookiejar.New(nil)
-	return &Manager{
-		baseURL:   apiURL,
-		projectID: DefaultProjectID,
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-			Jar:     jar,
-		},
+// Config holds initialization parameters.
+type Config struct {
+	DBURL         string // postgres connection string
+	TemporalHost  string // e.g. localhost:7233
+	ProjectID     string
+	RunMode       string // dev | prod | staging
+	EncryptionKey string // OLAKE_SECRET_KEY value (optional)
+}
+
+// New connects to PostgreSQL and Temporal, returning a ready Manager.
+// Temporal connection is attempted but failure is non-fatal (features requiring
+// Temporal will return errors at call time).
+func New(cfg Config) (*Manager, error) {
+	if cfg.ProjectID == "" {
+		cfg.ProjectID = DefaultProjectID
 	}
-}
-
-// projectPath builds a project-scoped API path.
-func (m *Manager) projectPath(path string) string {
-	return fmt.Sprintf("%s/api/v1/project/%s%s", m.baseURL, m.projectID, path)
-}
-
-// do performs an authenticated HTTP request and decodes the response.
-func (m *Manager) do(method, url string, body any, result any) error {
-	var bodyReader io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return fmt.Errorf("marshal: %w", err)
-		}
-		bodyReader = bytes.NewReader(b)
+	if cfg.RunMode == "" {
+		cfg.RunMode = DefaultRunMode
+	}
+	if cfg.TemporalHost == "" {
+		cfg.TemporalHost = DefaultTemporalHost
 	}
 
-	req, err := http.NewRequest(method, url, bodyReader)
+	if cfg.DBURL == "" {
+		return nil, fmt.Errorf("OLAKE_DB_URL is required (PostgreSQL connection string)")
+	}
+
+	db, err := sql.Open("postgres", cfg.DBURL)
 	if err != nil {
-		return fmt.Errorf("new request: %w", err)
+		return nil, fmt.Errorf("open postgres: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if m.token != "" {
-		req.Header.Set("Authorization", "Bearer "+m.token)
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
 
-	resp, err := m.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("http %s %s: %w", method, url, err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("read body: %w", err)
+	m := &Manager{
+		db:            db,
+		projectID:     cfg.ProjectID,
+		runMode:       cfg.RunMode,
+		encryptionKey: cfg.EncryptionKey,
 	}
 
-	if resp.StatusCode == 401 {
-		return fmt.Errorf("unauthorized — please log in")
+	// Connect Temporal (best-effort)
+	tc, err := client.Dial(client.Options{HostPort: cfg.TemporalHost})
+	if err == nil {
+		m.temporal = tc
 	}
-	if resp.StatusCode >= 400 {
-		var errResp struct {
-			Message string `json:"message"`
-		}
-		_ = json.Unmarshal(respBody, &errResp)
-		if errResp.Message != "" {
-			return fmt.Errorf("%s", errResp.Message)
-		}
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
+	// If Temporal dial fails we continue — features that need it will fail at call time.
 
-	if result != nil {
-		if err := json.Unmarshal(respBody, result); err != nil {
-			return fmt.Errorf("decode: %w", err)
-		}
-	}
-	return nil
+	return m, nil
 }
 
-// Login authenticates against the BFF and stores the session token.
+// Close releases DB and Temporal resources.
+func (m *Manager) Close() {
+	if m.db != nil {
+		_ = m.db.Close()
+	}
+	if m.temporal != nil {
+		m.temporal.Close()
+	}
+}
+
+// ─── Table names (matches BFF convention: olake-<runMode>-<entity>) ─────────
+
+func (m *Manager) tbl(entity string) string {
+	return fmt.Sprintf(`"olake-%s-%s"`, m.runMode, entity)
+}
+
+// ─── Encryption (same AES-256-GCM as BFF utils/encryption.go) ───────────────
+
+func (m *Manager) encryptionKeyBytes() []byte {
+	if strings.TrimSpace(m.encryptionKey) == "" {
+		return nil
+	}
+	h := sha256.Sum256([]byte(m.encryptionKey))
+	return h[:]
+}
+
+func (m *Manager) encrypt(plaintext string) (string, error) {
+	if strings.TrimSpace(plaintext) == "" {
+		return plaintext, nil
+	}
+	key := m.encryptionKeyBytes()
+	if key == nil {
+		return plaintext, nil // no encryption configured
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", fmt.Errorf("create cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("create GCM: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", fmt.Errorf("generate nonce: %w", err)
+	}
+	ct := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
+	// BFF stores as JSON-quoted base64 string
+	b64 := base64.StdEncoding.EncodeToString(ct)
+	out, err := json.Marshal(b64)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+func (m *Manager) decrypt(encryptedText string) (string, error) {
+	if strings.TrimSpace(encryptedText) == "" {
+		return encryptedText, nil
+	}
+	key := m.encryptionKeyBytes()
+	if key == nil {
+		return encryptedText, nil // no encryption configured
+	}
+
+	var b64 string
+	if err := json.Unmarshal([]byte(encryptedText), &b64); err != nil {
+		// Not JSON-quoted → stored as plain text (no encryption when written)
+		return encryptedText, nil
+	}
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return "", fmt.Errorf("base64 decode: %w", err)
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", fmt.Errorf("create cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("create GCM: %w", err)
+	}
+	if len(data) < gcm.NonceSize() {
+		return "", errors.New("ciphertext too short")
+	}
+	plaintext, err := gcm.Open(nil, data[:gcm.NonceSize()], data[gcm.NonceSize():], nil)
+	if err != nil {
+		return "", fmt.Errorf("decrypt: %w", err)
+	}
+	return string(plaintext), nil
+}
+
+// ─── Auth ────────────────────────────────────────────────────────────────────
+
+// Login authenticates against the PostgreSQL user table.
 func (m *Manager) Login(username, password string) error {
-	payload := map[string]string{"username": username, "password": password}
-	var resp APIResponse[map[string]string]
-	if err := m.do("POST", m.baseURL+"/login", payload, &resp); err != nil {
-		return err
+	query := fmt.Sprintf(`SELECT id, password FROM %s WHERE username = $1 LIMIT 1`, m.tbl("user"))
+	var id int
+	var hashedPwd string
+	err := m.db.QueryRowContext(context.Background(), query, username).Scan(&id, &hashedPwd)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("invalid credentials")
 	}
-	if !resp.Success {
-		return fmt.Errorf("%s", resp.Message)
+	if err != nil {
+		return fmt.Errorf("login query: %w", err)
 	}
-	m.token = "authenticated"
+	if err := bcrypt.CompareHashAndPassword([]byte(hashedPwd), []byte(password)); err != nil {
+		return fmt.Errorf("invalid credentials")
+	}
+	m.authenticated = true
 	m.username = username
+	m.userID = id
 	return nil
 }
 
-// IsAuthenticated returns true if a token is present.
-func (m *Manager) IsAuthenticated() bool {
-	return m.token != ""
-}
+// IsAuthenticated returns true after a successful Login call.
+func (m *Manager) IsAuthenticated() bool { return m.authenticated }
 
 // Username returns the logged-in username.
-func (m *Manager) Username() string {
-	return m.username
-}
+func (m *Manager) Username() string { return m.username }
 
-// CheckAuth verifies the current session is still valid.
+// CheckAuth is a no-op for the direct service layer (always returns nil when authenticated).
 func (m *Manager) CheckAuth() error {
-	var resp APIResponse[map[string]string]
-	return m.do("GET", m.baseURL+"/auth/check", nil, &resp)
+	if !m.authenticated {
+		return fmt.Errorf("not authenticated")
+	}
+	return nil
 }
 
-// --- Sources ---
+// ─── Sources ─────────────────────────────────────────────────────────────────
 
 // ListSources returns all sources for the project.
 func (m *Manager) ListSources() ([]Source, error) {
-	var resp APIResponse[[]Source]
-	if err := m.do("GET", m.projectPath("/sources"), nil, &resp); err != nil {
-		return nil, err
+	q := fmt.Sprintf(`
+		SELECT s.id, s.name, s.type, s.version, s.config, s.created_at, s.updated_at,
+		       COALESCE(cu.username,'') AS created_by, COALESCE(uu.username,'') AS updated_by
+		FROM %s s
+		LEFT JOIN %s cu ON s.created_by_id = cu.id
+		LEFT JOIN %s uu ON s.updated_by_id = uu.id
+		WHERE s.project_id = $1 AND s.deleted_at IS NULL
+		ORDER BY s.updated_at DESC`,
+		m.tbl("source"), m.tbl("user"), m.tbl("user"))
+
+	rows, err := m.db.QueryContext(context.Background(), q, m.projectID)
+	if err != nil {
+		return nil, fmt.Errorf("list sources: %w", err)
 	}
-	return resp.Data, nil
+	defer rows.Close()
+
+	var sources []Source
+	for rows.Next() {
+		var s Source
+		var encCfg string
+		if err := rows.Scan(&s.ID, &s.Name, &s.Type, &s.Version, &encCfg,
+			&s.CreatedAt, &s.UpdatedAt, &s.CreatedBy, &s.UpdatedBy); err != nil {
+			return nil, fmt.Errorf("scan source: %w", err)
+		}
+		s.Config, err = m.decrypt(encCfg)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt source config id[%d]: %w", s.ID, err)
+		}
+		sources = append(sources, s)
+	}
+	if sources == nil {
+		sources = []Source{}
+	}
+	return sources, rows.Err()
 }
 
 // GetSource returns a single source by ID.
 func (m *Manager) GetSource(id int) (*Source, error) {
-	var resp APIResponse[Source]
-	if err := m.do("GET", fmt.Sprintf("%s/%d", m.projectPath("/sources"), id), nil, &resp); err != nil {
-		return nil, err
+	q := fmt.Sprintf(`
+		SELECT s.id, s.name, s.type, s.version, s.config, s.created_at, s.updated_at,
+		       COALESCE(cu.username,'') AS created_by, COALESCE(uu.username,'') AS updated_by
+		FROM %s s
+		LEFT JOIN %s cu ON s.created_by_id = cu.id
+		LEFT JOIN %s uu ON s.updated_by_id = uu.id
+		WHERE s.id = $1 AND s.deleted_at IS NULL`,
+		m.tbl("source"), m.tbl("user"), m.tbl("user"))
+
+	var s Source
+	var encCfg string
+	err := m.db.QueryRowContext(context.Background(), q, id).Scan(
+		&s.ID, &s.Name, &s.Type, &s.Version, &encCfg,
+		&s.CreatedAt, &s.UpdatedAt, &s.CreatedBy, &s.UpdatedBy)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("source not found id[%d]", id)
 	}
-	return &resp.Data, nil
+	if err != nil {
+		return nil, fmt.Errorf("get source: %w", err)
+	}
+	s.Config, err = m.decrypt(encCfg)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt source config: %w", err)
+	}
+	return &s, nil
 }
 
 // CreateSource creates a new source.
 func (m *Manager) CreateSource(s EntityBase) (*EntityBase, error) {
-	var resp APIResponse[EntityBase]
-	if err := m.do("POST", m.projectPath("/sources"), s, &resp); err != nil {
-		return nil, err
+	encCfg, err := m.encrypt(s.Config)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt source config: %w", err)
 	}
-	return &resp.Data, nil
+	q := fmt.Sprintf(`
+		INSERT INTO %s (name, type, version, config, project_id, created_by_id, updated_by_id, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $6, NOW(), NOW())`,
+		m.tbl("source"))
+	_, err = m.db.ExecContext(context.Background(), q, s.Name, s.Type, s.Version, encCfg, m.projectID, m.userID)
+	if err != nil {
+		return nil, fmt.Errorf("create source: %w", err)
+	}
+	return &s, nil
 }
 
 // UpdateSource updates an existing source.
 func (m *Manager) UpdateSource(id int, s EntityBase) (*Source, error) {
-	var resp APIResponse[Source]
-	if err := m.do("PUT", fmt.Sprintf("%s/%d", m.projectPath("/sources"), id), s, &resp); err != nil {
-		return nil, err
+	encCfg, err := m.encrypt(s.Config)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt source config: %w", err)
 	}
-	return &resp.Data, nil
+	q := fmt.Sprintf(`
+		UPDATE %s SET name=$1, type=$2, version=$3, config=$4, updated_by_id=$5, updated_at=NOW()
+		WHERE id=$6`,
+		m.tbl("source"))
+	_, err = m.db.ExecContext(context.Background(), q, s.Name, s.Type, s.Version, encCfg, m.userID, id)
+	if err != nil {
+		return nil, fmt.Errorf("update source: %w", err)
+	}
+	return m.GetSource(id)
 }
 
 // DeleteSource deletes a source by ID.
 func (m *Manager) DeleteSource(id int) error {
-	return m.do("DELETE", fmt.Sprintf("%s/%d", m.projectPath("/sources"), id), nil, nil)
-}
-
-// TestSource tests a source connection.
-func (m *Manager) TestSource(s EntityBase) (*TestConnectionResult, error) {
-	var resp APIResponse[TestConnectionResult]
-	payload := map[string]string{
-		"type":    s.Type,
-		"version": s.Version,
-		"config":  s.Config,
-	}
-	client := &http.Client{Jar: m.client.Jar} // no timeout for test
-	b, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", m.projectPath("/sources/test"), bytes.NewReader(b))
-	req.Header.Set("Content-Type", "application/json")
-	if m.token != "" {
-		req.Header.Set("Authorization", "Bearer "+m.token)
-	}
-	httpResp, err := client.Do(req)
+	// Check no jobs reference this source
+	count, err := m.countJobsBySource(id)
 	if err != nil {
-		return &TestConnectionResult{}, err
+		return err
 	}
-	defer httpResp.Body.Close()
-	body, _ := io.ReadAll(httpResp.Body)
-	_ = json.Unmarshal(body, &resp)
-	return &resp.Data, nil
+	if count > 0 {
+		return fmt.Errorf("source is used by %d job(s); delete those jobs first", count)
+	}
+	q := fmt.Sprintf(`DELETE FROM %s WHERE id=$1`, m.tbl("source"))
+	_, err = m.db.ExecContext(context.Background(), q, id)
+	return err
 }
 
-// --- Destinations ---
+func (m *Manager) countJobsBySource(sourceID int) (int, error) {
+	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE source_id=$1`, m.tbl("job"))
+	var n int
+	err := m.db.QueryRowContext(context.Background(), q, sourceID).Scan(&n)
+	return n, err
+}
+
+// ─── Destinations ─────────────────────────────────────────────────────────────
 
 // ListDestinations returns all destinations for the project.
 func (m *Manager) ListDestinations() ([]Destination, error) {
-	var resp APIResponse[[]Destination]
-	if err := m.do("GET", m.projectPath("/destinations"), nil, &resp); err != nil {
-		return nil, err
+	q := fmt.Sprintf(`
+		SELECT d.id, d.name, d.type, d.version, d.config, d.created_at, d.updated_at,
+		       COALESCE(cu.username,'') AS created_by, COALESCE(uu.username,'') AS updated_by
+		FROM %s d
+		LEFT JOIN %s cu ON d.created_by_id = cu.id
+		LEFT JOIN %s uu ON d.updated_by_id = uu.id
+		WHERE d.project_id = $1 AND d.deleted_at IS NULL
+		ORDER BY d.updated_at DESC`,
+		m.tbl("destination"), m.tbl("user"), m.tbl("user"))
+
+	rows, err := m.db.QueryContext(context.Background(), q, m.projectID)
+	if err != nil {
+		return nil, fmt.Errorf("list destinations: %w", err)
 	}
-	return resp.Data, nil
+	defer rows.Close()
+
+	var dests []Destination
+	for rows.Next() {
+		var d Destination
+		var encCfg string
+		if err := rows.Scan(&d.ID, &d.Name, &d.Type, &d.Version, &encCfg,
+			&d.CreatedAt, &d.UpdatedAt, &d.CreatedBy, &d.UpdatedBy); err != nil {
+			return nil, fmt.Errorf("scan destination: %w", err)
+		}
+		d.Config, err = m.decrypt(encCfg)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt destination config id[%d]: %w", d.ID, err)
+		}
+		dests = append(dests, d)
+	}
+	if dests == nil {
+		dests = []Destination{}
+	}
+	return dests, rows.Err()
 }
 
 // GetDestination returns a single destination by ID.
 func (m *Manager) GetDestination(id int) (*Destination, error) {
-	var resp APIResponse[Destination]
-	if err := m.do("GET", fmt.Sprintf("%s/%d", m.projectPath("/destinations"), id), nil, &resp); err != nil {
-		return nil, err
+	q := fmt.Sprintf(`
+		SELECT d.id, d.name, d.type, d.version, d.config, d.created_at, d.updated_at,
+		       COALESCE(cu.username,'') AS created_by, COALESCE(uu.username,'') AS updated_by
+		FROM %s d
+		LEFT JOIN %s cu ON d.created_by_id = cu.id
+		LEFT JOIN %s uu ON d.updated_by_id = uu.id
+		WHERE d.id = $1 AND d.deleted_at IS NULL`,
+		m.tbl("destination"), m.tbl("user"), m.tbl("user"))
+
+	var d Destination
+	var encCfg string
+	err := m.db.QueryRowContext(context.Background(), q, id).Scan(
+		&d.ID, &d.Name, &d.Type, &d.Version, &encCfg,
+		&d.CreatedAt, &d.UpdatedAt, &d.CreatedBy, &d.UpdatedBy)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("destination not found id[%d]", id)
 	}
-	return &resp.Data, nil
+	if err != nil {
+		return nil, fmt.Errorf("get destination: %w", err)
+	}
+	d.Config, err = m.decrypt(encCfg)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt destination config: %w", err)
+	}
+	return &d, nil
 }
 
 // CreateDestination creates a new destination.
 func (m *Manager) CreateDestination(d EntityBase) (*EntityBase, error) {
-	var resp APIResponse[EntityBase]
-	if err := m.do("POST", m.projectPath("/destinations"), d, &resp); err != nil {
-		return nil, err
+	encCfg, err := m.encrypt(d.Config)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt destination config: %w", err)
 	}
-	return &resp.Data, nil
+	q := fmt.Sprintf(`
+		INSERT INTO %s (name, type, version, config, project_id, created_by_id, updated_by_id, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $6, NOW(), NOW())`,
+		m.tbl("destination"))
+	_, err = m.db.ExecContext(context.Background(), q, d.Name, d.Type, d.Version, encCfg, m.projectID, m.userID)
+	if err != nil {
+		return nil, fmt.Errorf("create destination: %w", err)
+	}
+	return &d, nil
 }
 
 // UpdateDestination updates an existing destination.
 func (m *Manager) UpdateDestination(id int, d EntityBase) (*EntityBase, error) {
-	var resp APIResponse[EntityBase]
-	if err := m.do("PUT", fmt.Sprintf("%s/%d", m.projectPath("/destinations"), id), d, &resp); err != nil {
-		return nil, err
+	encCfg, err := m.encrypt(d.Config)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt destination config: %w", err)
 	}
-	return &resp.Data, nil
+	q := fmt.Sprintf(`
+		UPDATE %s SET name=$1, type=$2, version=$3, config=$4, updated_by_id=$5, updated_at=NOW()
+		WHERE id=$6`,
+		m.tbl("destination"))
+	_, err = m.db.ExecContext(context.Background(), q, d.Name, d.Type, d.Version, encCfg, m.userID, id)
+	if err != nil {
+		return nil, fmt.Errorf("update destination: %w", err)
+	}
+	return &d, nil
 }
 
 // DeleteDestination deletes a destination by ID.
 func (m *Manager) DeleteDestination(id int) error {
-	return m.do("DELETE", fmt.Sprintf("%s/%d", m.projectPath("/destinations"), id), nil, nil)
+	count, err := m.countJobsByDest(id)
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		return fmt.Errorf("destination is used by %d job(s); delete those jobs first", count)
+	}
+	q := fmt.Sprintf(`DELETE FROM %s WHERE id=$1`, m.tbl("destination"))
+	_, err = m.db.ExecContext(context.Background(), q, id)
+	return err
 }
 
-// --- Jobs ---
+func (m *Manager) countJobsByDest(destID int) (int, error) {
+	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE dest_id=$1`, m.tbl("job"))
+	var n int
+	err := m.db.QueryRowContext(context.Background(), q, destID).Scan(&n)
+	return n, err
+}
+
+// ─── Jobs ─────────────────────────────────────────────────────────────────────
 
 // ListJobs returns all jobs for the project.
 func (m *Manager) ListJobs() ([]Job, error) {
-	var resp APIResponse[[]Job]
-	if err := m.do("GET", m.projectPath("/jobs"), nil, &resp); err != nil {
-		return nil, err
+	q := fmt.Sprintf(`
+		SELECT j.id, j.name, j.frequency, j.active, j.advanced_settings,
+		       j.created_at, j.updated_at,
+		       COALESCE(cu.username,'') AS created_by, COALESCE(uu.username,'') AS updated_by,
+		       s.id, s.name, s.type, s.version,
+		       d.id, d.name, d.type, d.version
+		FROM %s j
+		LEFT JOIN %s s ON j.source_id = s.id
+		LEFT JOIN %s d ON j.dest_id = d.id
+		LEFT JOIN %s cu ON j.created_by_id = cu.id
+		LEFT JOIN %s uu ON j.updated_by_id = uu.id
+		WHERE j.project_id = $1
+		ORDER BY j.updated_at DESC`,
+		m.tbl("job"), m.tbl("source"), m.tbl("destination"), m.tbl("user"), m.tbl("user"))
+
+	rows, err := m.db.QueryContext(context.Background(), q, m.projectID)
+	if err != nil {
+		return nil, fmt.Errorf("list jobs: %w", err)
 	}
-	return resp.Data, nil
+	defer rows.Close()
+
+	var jobs []Job
+	for rows.Next() {
+		j, err := m.scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	if jobs == nil {
+		jobs = []Job{}
+	}
+	return jobs, rows.Err()
 }
 
 // GetJob returns a single job by ID.
 func (m *Manager) GetJob(id int) (*Job, error) {
-	var resp APIResponse[Job]
-	if err := m.do("GET", fmt.Sprintf("%s/%d", m.projectPath("/jobs"), id), nil, &resp); err != nil {
+	q := fmt.Sprintf(`
+		SELECT j.id, j.name, j.frequency, j.active, j.advanced_settings,
+		       j.created_at, j.updated_at,
+		       COALESCE(cu.username,'') AS created_by, COALESCE(uu.username,'') AS updated_by,
+		       s.id, s.name, s.type, s.version,
+		       d.id, d.name, d.type, d.version
+		FROM %s j
+		LEFT JOIN %s s ON j.source_id = s.id
+		LEFT JOIN %s d ON j.dest_id = d.id
+		LEFT JOIN %s cu ON j.created_by_id = cu.id
+		LEFT JOIN %s uu ON j.updated_by_id = uu.id
+		WHERE j.id = $1`,
+		m.tbl("job"), m.tbl("source"), m.tbl("destination"), m.tbl("user"), m.tbl("user"))
+
+	rows, err := m.db.QueryContext(context.Background(), q, id)
+	if err != nil {
+		return nil, fmt.Errorf("get job: %w", err)
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return nil, fmt.Errorf("job not found id[%d]", id)
+	}
+	j, err := m.scanJob(rows)
+	if err != nil {
 		return nil, err
 	}
-	return &resp.Data, nil
+	return &j, rows.Err()
 }
 
-// DeleteJob deletes a job by ID.
+// scanJob scans a row from the jobs query into a Job struct.
+func (m *Manager) scanJob(rows *sql.Rows) (Job, error) {
+	var j Job
+	var advRaw sql.NullString
+	var srcID sql.NullInt64
+	var srcName, srcType, srcVersion sql.NullString
+	var dstID sql.NullInt64
+	var dstName, dstType, dstVersion sql.NullString
+
+	err := rows.Scan(
+		&j.ID, &j.Name, &j.Frequency, &j.Activate, &advRaw,
+		&j.CreatedAt, &j.UpdatedAt, &j.CreatedBy, &j.UpdatedBy,
+		&srcID, &srcName, &srcType, &srcVersion,
+		&dstID, &dstName, &dstType, &dstVersion,
+	)
+	if err != nil {
+		return Job{}, fmt.Errorf("scan job: %w", err)
+	}
+
+	if srcID.Valid {
+		j.Source = JobConnector{
+			ID:      int(srcID.Int64),
+			Name:    srcName.String,
+			Type:    srcType.String,
+			Version: srcVersion.String,
+		}
+	}
+	if dstID.Valid {
+		j.Destination = JobConnector{
+			ID:      int(dstID.Int64),
+			Name:    dstName.String,
+			Type:    dstType.String,
+			Version: dstVersion.String,
+		}
+	}
+	if advRaw.Valid && advRaw.String != "" && advRaw.String != "{}" {
+		var adv AdvancedSettings
+		if err := json.Unmarshal([]byte(advRaw.String), &adv); err == nil {
+			j.AdvancedSettings = &adv
+		}
+	}
+	return j, nil
+}
+
+// DeleteJob deletes a job by ID, and removes its Temporal schedule if connected.
 func (m *Manager) DeleteJob(id int) error {
-	return m.do("DELETE", fmt.Sprintf("%s/%d", m.projectPath("/jobs"), id), nil, nil)
+	job, err := m.GetJob(id)
+	if err != nil {
+		return err
+	}
+
+	// Best-effort: remove Temporal schedule
+	if m.temporal != nil {
+		_, scheduleID := m.workflowAndScheduleID(m.projectID, id)
+		handle := m.temporal.ScheduleClient().GetHandle(context.Background(), scheduleID)
+		_ = handle.Delete(context.Background()) // ignore error if not found
+	}
+
+	q := fmt.Sprintf(`DELETE FROM %s WHERE id=$1`, m.tbl("job"))
+	_, err = m.db.ExecContext(context.Background(), q, id)
+	_ = job // referenced above
+	return err
 }
 
-// TriggerSync triggers an immediate sync for a job.
+// TriggerSync triggers an immediate sync for a job via Temporal schedule.
 func (m *Manager) TriggerSync(id int) error {
-	return m.do("POST", fmt.Sprintf("%s/%d/sync", m.projectPath("/jobs"), id), map[string]any{}, nil)
+	if m.temporal == nil {
+		return fmt.Errorf("temporal client not connected — set TEMPORAL_ADDRESS")
+	}
+	_, scheduleID := m.workflowAndScheduleID(m.projectID, id)
+	handle := m.temporal.ScheduleClient().GetHandle(context.Background(), scheduleID)
+	return handle.Trigger(context.Background(), client.ScheduleTriggerOptions{})
 }
 
-// CancelJob cancels a running job.
+// CancelJob cancels a running workflow for a job.
 func (m *Manager) CancelJob(id int) error {
-	return m.do("GET", fmt.Sprintf("%s/%d/cancel", m.projectPath("/jobs"), id), nil, nil)
+	if m.temporal == nil {
+		return fmt.Errorf("temporal client not connected — set TEMPORAL_ADDRESS")
+	}
+	workflowID, _ := m.workflowAndScheduleID(m.projectID, id)
+	// Cancel any running workflow with this ID prefix
+	return m.temporal.CancelWorkflow(context.Background(), workflowID, "")
 }
 
-// ActivateJob pauses or resumes a job.
+// ActivateJob pauses or resumes a job's Temporal schedule and updates the DB.
 func (m *Manager) ActivateJob(id int, activate bool) error {
-	return m.do("POST", fmt.Sprintf("%s/%d/activate", m.projectPath("/jobs"), id),
-		map[string]bool{"activate": activate}, nil)
+	if m.temporal != nil {
+		_, scheduleID := m.workflowAndScheduleID(m.projectID, id)
+		handle := m.temporal.ScheduleClient().GetHandle(context.Background(), scheduleID)
+		if activate {
+			_ = handle.Unpause(context.Background(), client.ScheduleUnpauseOptions{Note: "user resumed"})
+		} else {
+			_ = handle.Pause(context.Background(), client.SchedulePauseOptions{Note: "user paused"})
+		}
+	}
+
+	q := fmt.Sprintf(`UPDATE %s SET active=$1, updated_by_id=$2, updated_at=NOW() WHERE id=$3`, m.tbl("job"))
+	_, err := m.db.ExecContext(context.Background(), q, activate, m.userID, id)
+	return err
 }
 
-// ListJobTasks returns the run history for a job.
+// ListJobTasks returns the run history for a job from Temporal.
 func (m *Manager) ListJobTasks(jobID int) ([]JobTask, error) {
-	var resp APIResponse[[]JobTask]
-	if err := m.do("GET", fmt.Sprintf("%s/%d/tasks", m.projectPath("/jobs"), jobID), nil, &resp); err != nil {
-		return nil, err
+	if m.temporal == nil {
+		return nil, fmt.Errorf("temporal client not connected — set TEMPORAL_ADDRESS")
 	}
-	return resp.Data, nil
+
+	query := fmt.Sprintf("WorkflowId BETWEEN 'sync-%s-%d-' AND 'sync-%s-%d-z'",
+		m.projectID, jobID, m.projectID, jobID)
+
+	resp, err := m.temporal.ListWorkflow(context.Background(), &workflowservice.ListWorkflowExecutionsRequest{
+		Query: query,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list workflows: %w", err)
+	}
+
+	var tasks []JobTask
+	for _, execution := range resp.GetExecutions() {
+		startTime := execution.GetStartTime().AsTime().UTC()
+		var runTime string
+		if ct := execution.GetCloseTime(); ct != nil {
+			runTime = ct.AsTime().UTC().Sub(startTime).Round(time.Second).String()
+		} else {
+			runTime = time.Since(startTime).Round(time.Second).String()
+		}
+		tasks = append(tasks, JobTask{
+			Runtime:   runTime,
+			StartTime: startTime.Format(time.RFC3339),
+			Status:    execution.GetStatus().String(),
+			FilePath:  execution.GetExecution().GetWorkflowId(),
+			JobType:   "sync",
+		})
+	}
+	return tasks, nil
 }
 
-// GetTaskLogs returns paginated logs for a job task.
+// GetTaskLogs returns paginated log entries for a job task.
+// For the direct service layer this is a stub — log files are written by the
+// Temporal worker and live on the worker host. The TUI shows a message to the user.
 func (m *Manager) GetTaskLogs(jobID int, taskID string, filePath string, cursor int64, limit int, direction string) (*TaskLogsResponse, error) {
-	url := fmt.Sprintf("%s/%d/tasks/%s/logs?cursor=%d&limit=%d&direction=%s",
-		m.projectPath("/jobs"), jobID, taskID, cursor, limit, direction)
-	payload := map[string]string{"file_path": filePath}
-	var resp APIResponse[TaskLogsResponse]
-	if err := m.do("POST", url, payload, &resp); err != nil {
-		return nil, err
-	}
-	return &resp.Data, nil
+	return &TaskLogsResponse{
+		Logs: []LogEntry{{
+			Level:   "info",
+			Time:    time.Now().Format(time.RFC3339),
+			Message: "Log streaming requires access to the Temporal worker host filesystem. Use the BFF API for remote log access.",
+		}},
+	}, nil
 }
 
 // GetSettings returns project-level settings.
 func (m *Manager) GetSettings() (*SystemSettings, error) {
-	var resp APIResponse[SystemSettings]
-	if err := m.do("GET", m.projectPath("/settings"), nil, &resp); err != nil {
-		return nil, err
+	q := fmt.Sprintf(`
+		SELECT id, project_id, COALESCE(webhook_alert_url,'') FROM %s WHERE project_id=$1 LIMIT 1`,
+		m.tbl("project-settings"))
+	var s SystemSettings
+	err := m.db.QueryRowContext(context.Background(), q, m.projectID).Scan(&s.ID, &s.ProjectID, &s.WebhookAlertURL)
+	if err == sql.ErrNoRows {
+		return &SystemSettings{ProjectID: m.projectID}, nil
 	}
-	return &resp.Data, nil
+	if err != nil {
+		return nil, fmt.Errorf("get settings: %w", err)
+	}
+	return &s, nil
 }
 
 // UpdateSettings saves project-level settings.
 func (m *Manager) UpdateSettings(s SystemSettings) error {
-	return m.do("PUT", m.projectPath("/settings"), s, nil)
+	q := fmt.Sprintf(`
+		INSERT INTO %s (project_id, webhook_alert_url, created_at, updated_at)
+		VALUES ($1, $2, NOW(), NOW())
+		ON CONFLICT (project_id) DO UPDATE SET webhook_alert_url=EXCLUDED.webhook_alert_url, updated_at=NOW()`,
+		m.tbl("project-settings"))
+	_, err := m.db.ExecContext(context.Background(), q, m.projectID, s.WebhookAlertURL)
+	return err
+}
+
+// TestSource is not implemented in the direct service layer (requires Temporal worker).
+func (m *Manager) TestSource(s EntityBase) (*TestConnectionResult, error) {
+	return &TestConnectionResult{}, fmt.Errorf("connection testing requires the Temporal worker; not available in direct DB mode")
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// workflowAndScheduleID matches the BFF's naming convention.
+func (m *Manager) workflowAndScheduleID(projectID string, jobID int) (string, string) {
+	workflowID := fmt.Sprintf("sync-%s-%d", projectID, jobID)
+	return workflowID, fmt.Sprintf("schedule-%s", workflowID)
 }
