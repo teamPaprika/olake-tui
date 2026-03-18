@@ -27,6 +27,8 @@ const (
 	ScreenJobSettings
 	ScreenSystemSettings
 	ScreenJobWizard
+	ScreenSourceForm
+	ScreenDestForm
 )
 
 // Tab identifiers (for main navigation).
@@ -85,6 +87,11 @@ type msgJobCreatedWizard struct {
 	job *service.Job
 	err error
 }
+type msgSourceCreated struct{ err error }
+type msgSourceUpdated struct{ err error }
+type msgDestCreated struct{ err error }
+type msgDestUpdated struct{ err error }
+type msgTestSourceDone struct{ err error }
 
 // confirmContext identifies what action a confirmation dialog is for.
 type confirmContext int
@@ -129,6 +136,9 @@ type Model struct {
 	// Job creation wizard
 	wizard       *ui.JobWizardModel
 
+	// Entity (source/dest) create/edit form
+	entityForm   *ui.EntityFormModel
+
 	// Data
 	jobList   []service.Job
 	srcList   []service.Source
@@ -169,11 +179,21 @@ func (m Model) Init() tea.Cmd {
 	)
 }
 
-// showToast shows a transient notification that auto-clears after 3 seconds.
+// msgShowToast is sent to set the toast notification text and start the expiry timer.
+// Using a message (rather than direct state mutation in a standalone function) lets
+// the Bubble Tea update loop properly apply the toast to the model.
+type msgShowToast struct {
+	msg   string
+	isErr bool
+}
+
+// showToast returns a Cmd that immediately delivers a msgShowToast message to the
+// update loop, which sets m.toast / m.toastError. The update handler then starts
+// the 3-second expiry timer. Callers must NOT set m.toast/m.toastError themselves.
 func showToast(msg string, isErr bool) tea.Cmd {
-	return tea.Tick(3*time.Second, func(_ time.Time) tea.Msg {
-		return msgToastExpired{}
-	})
+	return func() tea.Msg {
+		return msgShowToast{msg: msg, isErr: isErr}
+	}
 }
 
 // Update handles all messages and key events.
@@ -204,6 +224,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.wizard != nil {
 			m.wizard.SetSize(m.width, m.height)
 		}
+		if m.entityForm != nil {
+			m.entityForm.SetSize(m.width, m.height)
+		}
+
+	// ---------- Toast show ----------
+	case msgShowToast:
+		m.toast = msg.msg
+		m.toastError = msg.isErr
+		// Start the 3-second auto-clear timer.
+		cmds = append(cmds, tea.Tick(3*time.Second, func(_ time.Time) tea.Msg {
+			return msgToastExpired{}
+		}))
 
 	// ---------- Toast expiry ----------
 	case msgToastExpired:
@@ -240,47 +272,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case msgJobDeleted:
 		if msg.err != nil {
-			m.toast = "Delete failed: " + msg.err.Error()
-			m.toastError = true
+			cmds = append(cmds, showToast("Delete failed: "+msg.err.Error(), true))
 		} else {
-			m.toast = "Job deleted"
-			m.toastError = false
 			m.jobs.SetLoading(true)
-			cmds = append(cmds, m.loadJobs())
+			cmds = append(cmds, m.loadJobs(), showToast("Job deleted", false))
 		}
-		cmds = append(cmds, showToast(m.toast, m.toastError))
 
 	case msgSyncTriggered:
 		if msg.err != nil {
-			m.toast = "Sync failed: " + msg.err.Error()
-			m.toastError = true
+			cmds = append(cmds, showToast("Sync failed: "+msg.err.Error(), true))
 		} else {
-			m.toast = "Sync triggered!"
-			m.toastError = false
+			cmds = append(cmds, showToast("Sync triggered!", false))
 		}
-		cmds = append(cmds, showToast(m.toast, m.toastError))
 
 	case msgCancelDone:
 		if msg.err != nil {
-			m.toast = "Cancel failed: " + msg.err.Error()
-			m.toastError = true
+			cmds = append(cmds, showToast("Cancel failed: "+msg.err.Error(), true))
 		} else {
-			m.toast = "Job cancelled"
-			m.toastError = false
+			cmds = append(cmds, showToast("Job cancelled", false))
 		}
-		cmds = append(cmds, showToast(m.toast, m.toastError))
 
 	case msgActivateDone:
 		if msg.err != nil {
-			m.toast = "Failed: " + msg.err.Error()
-			m.toastError = true
+			cmds = append(cmds, showToast("Failed: "+msg.err.Error(), true))
 		} else {
-			m.toast = "Job updated"
-			m.toastError = false
 			m.jobs.SetLoading(true)
-			cmds = append(cmds, m.loadJobs())
+			cmds = append(cmds, m.loadJobs(), showToast("Job updated", false))
 		}
-		cmds = append(cmds, showToast(m.toast, m.toastError))
 
 	// ---------- Task history ----------
 	case msgTasksLoaded:
@@ -295,31 +313,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ---------- Job settings saved ----------
 	case msgJobSettingsSaved:
 		if msg.err != nil {
-			m.toast = "Save failed: " + msg.err.Error()
-			m.toastError = true
+			cmds = append(cmds, showToast("Save failed: "+msg.err.Error(), true))
 		} else {
-			m.toast = "Job settings saved"
-			m.toastError = false
 			m.screen = ScreenJobs
 			m.jobSettings = nil
 			m.jobs.SetLoading(true)
-			cmds = append(cmds, m.loadJobs())
+			cmds = append(cmds, m.loadJobs(), showToast("Job settings saved", false))
 		}
-		cmds = append(cmds, showToast(m.toast, m.toastError))
 
 	// ---------- Clear destination ----------
 	case msgClearDestDone:
 		if msg.err != nil {
-			m.toast = "Clear destination failed: " + msg.err.Error()
-			m.toastError = true
+			cmds = append(cmds, showToast("Clear destination failed: "+msg.err.Error(), true))
 		} else {
-			m.toast = "Clear destination triggered!"
-			m.toastError = false
 			// Navigate back to jobs list
 			m.screen = ScreenJobs
 			m.jobSettings = nil
+			cmds = append(cmds, showToast("Clear destination triggered!", false))
 		}
-		cmds = append(cmds, showToast(m.toast, m.toastError))
 
 	// ---------- System settings ----------
 	case msgSettingsLoaded:
@@ -333,13 +344,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case msgSettingsSaved:
 		if msg.err != nil {
-			m.toast = "Settings save failed: " + msg.err.Error()
-			m.toastError = true
+			cmds = append(cmds, showToast("Settings save failed: "+msg.err.Error(), true))
 		} else {
-			m.toast = "Settings saved"
-			m.toastError = false
+			cmds = append(cmds, showToast("Settings saved", false))
 		}
-		cmds = append(cmds, showToast(m.toast, m.toastError))
 
 	// ---------- Sources ----------
 	case msgSourcesLoaded:
@@ -352,15 +360,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case msgSourceDeleted:
 		if msg.err != nil {
-			m.toast = "Delete failed: " + msg.err.Error()
-			m.toastError = true
+			cmds = append(cmds, showToast("Delete failed: "+msg.err.Error(), true))
 		} else {
-			m.toast = "Source deleted"
-			m.toastError = false
 			m.sources.SetLoading(true)
-			cmds = append(cmds, m.loadSources())
+			cmds = append(cmds, m.loadSources(), showToast("Source deleted", false))
 		}
-		cmds = append(cmds, showToast(m.toast, m.toastError))
 
 	// ---------- Destinations ----------
 	case msgDestsLoaded:
@@ -373,15 +377,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case msgDestDeleted:
 		if msg.err != nil {
-			m.toast = "Delete failed: " + msg.err.Error()
-			m.toastError = true
+			cmds = append(cmds, showToast("Delete failed: "+msg.err.Error(), true))
 		} else {
-			m.toast = "Destination deleted"
-			m.toastError = false
 			m.destinations.SetLoading(true)
-			cmds = append(cmds, m.loadDests())
+			cmds = append(cmds, m.loadDests(), showToast("Destination deleted", false))
 		}
-		cmds = append(cmds, showToast(m.toast, m.toastError))
 
 	// ---------- Logs ----------
 	case msgLogsLoaded:
@@ -475,6 +475,60 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sysSettings = nil
 		return m, nil
 
+	// ---------- Entity form messages ----------
+	case ui.EntityFormSubmitMsg:
+		return m, m.handleEntityFormSubmit(msg)
+
+	case ui.EntityFormCancelMsg:
+		return m.closeEntityForm(), nil
+
+	case msgSourceCreated:
+		m.entityForm = nil
+		m.screen = ScreenSources
+		if msg.err != nil {
+			cmds = append(cmds, showToast("Create failed: "+msg.err.Error(), true))
+		} else {
+			m.sources.SetLoading(true)
+			cmds = append(cmds, m.loadSources(), showToast("Source created!", false))
+		}
+
+	case msgSourceUpdated:
+		m.entityForm = nil
+		m.screen = ScreenSources
+		if msg.err != nil {
+			cmds = append(cmds, showToast("Update failed: "+msg.err.Error(), true))
+		} else {
+			m.sources.SetLoading(true)
+			cmds = append(cmds, m.loadSources(), showToast("Source updated!", false))
+		}
+
+	case msgDestCreated:
+		m.entityForm = nil
+		m.screen = ScreenDestinations
+		if msg.err != nil {
+			cmds = append(cmds, showToast("Create failed: "+msg.err.Error(), true))
+		} else {
+			m.destinations.SetLoading(true)
+			cmds = append(cmds, m.loadDests(), showToast("Destination created!", false))
+		}
+
+	case msgDestUpdated:
+		m.entityForm = nil
+		m.screen = ScreenDestinations
+		if msg.err != nil {
+			cmds = append(cmds, showToast("Update failed: "+msg.err.Error(), true))
+		} else {
+			m.destinations.SetLoading(true)
+			cmds = append(cmds, m.loadDests(), showToast("Destination updated!", false))
+		}
+
+	case msgTestSourceDone:
+		if msg.err != nil {
+			cmds = append(cmds, showToast("Connection test failed: "+msg.err.Error(), true))
+		} else {
+			cmds = append(cmds, showToast("Connection test succeeded!", false))
+		}
+
 	// ---------- Wizard messages ----------
 	case ui.WizardMsg:
 		return m.handleWizardMsg(msg)
@@ -490,15 +544,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.wizard = nil
 		m.screen = ScreenJobs
 		if msg.err != nil {
-			m.toast = "Create job failed: " + msg.err.Error()
-			m.toastError = true
+			cmds = append(cmds, showToast("Create job failed: "+msg.err.Error(), true))
 		} else {
-			m.toast = "Job created!"
-			m.toastError = false
 			m.jobs.SetLoading(true)
-			cmds = append(cmds, m.loadJobs())
+			cmds = append(cmds, m.loadJobs(), showToast("Job created!", false))
 		}
-		cmds = append(cmds, showToast(m.toast, m.toastError))
 
 	// ---------- Key events ----------
 	case tea.KeyMsg:
@@ -552,6 +602,10 @@ func (m Model) handleKey(msg tea.KeyMsg, cmds []tea.Cmd) (tea.Model, tea.Cmd) {
 		case ScreenConfirm:
 			m.screen = m.screenBeforeConfirm()
 			return m, nil
+		case ScreenSourceForm:
+			return m.closeEntityForm(), nil
+		case ScreenDestForm:
+			return m.closeEntityForm(), nil
 		}
 	}
 
@@ -591,6 +645,13 @@ func (m Model) handleKey(msg tea.KeyMsg, cmds []tea.Cmd) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	// Entity form screen (source/dest create or edit)
+	if (m.screen == ScreenSourceForm || m.screen == ScreenDestForm) && m.entityForm != nil {
+		ef, cmd := m.entityForm.Update(msg)
+		m.entityForm = &ef
+		return m, cmd
+	}
+
 	// Job settings screen
 	if m.screen == ScreenJobSettings && m.jobSettings != nil {
 		settings, cmd := m.jobSettings.Update(msg)
@@ -615,18 +676,18 @@ func (m Model) handleKey(msg tea.KeyMsg, cmds []tea.Cmd) (tea.Model, tea.Cmd) {
 	// Tab switching
 	switch msg.String() {
 	case "1":
-		return m.switchTab(TabJobs), nil
+		return m.switchTab(TabJobs)
 	case "2":
-		return m.switchTab(TabSources), nil
+		return m.switchTab(TabSources)
 	case "3":
-		return m.switchTab(TabDestinations), nil
+		return m.switchTab(TabDestinations)
 	case "4":
-		return m.switchTab(TabSettings), nil
+		return m.switchTab(TabSettings)
 	case "5":
 		return m.openSystemSettings()
 	case "tab":
 		next := (int(m.tab) + 1) % 5
-		return m.switchTab(Tab(next)), nil
+		return m.switchTab(Tab(next))
 	}
 
 	// Tab-specific actions
@@ -687,6 +748,22 @@ func (m Model) handleTabKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.sources.SetLoading(true)
 			return m, m.loadSources()
+		case "a":
+			return m.openSourceCreate()
+		case "e":
+			if s := m.sources.SelectedSource(); s != nil {
+				return m.openSourceEdit(s)
+			}
+		case "t":
+			if s := m.sources.SelectedSource(); s != nil {
+				eb := service.EntityBase{Name: s.Name, Type: s.Type, Version: s.Version, Config: s.Config}
+				svc := m.svc
+				testCmd := func() tea.Msg {
+					_, err := svc.TestSource(eb)
+					return msgTestSourceDone{err: err}
+				}
+				return m, tea.Batch(showToast("Testing connection…", false), testCmd)
+			}
 		case "d":
 			if s := m.sources.SelectedSource(); s != nil {
 				return m.showConfirm("Delete Source", fmt.Sprintf("Delete source '%s'?", s.Name), confirmDeleteSource, s.ID), nil
@@ -702,6 +779,17 @@ func (m Model) handleTabKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.destinations.SetLoading(true)
 			return m, m.loadDests()
+		case "a":
+			return m.openDestCreate()
+		case "e":
+			if d := m.destinations.SelectedDestination(); d != nil {
+				return m.openDestEdit(d)
+			}
+		case "t":
+			if d := m.destinations.SelectedDestination(); d != nil {
+				// Destination connection test not implemented in direct service layer.
+				return m, showToast("Connection test requires BFF server (not available in direct mode)", true)
+			}
 		case "d":
 			if d := m.destinations.SelectedDestination(); d != nil {
 				return m.showConfirm("Delete Destination", fmt.Sprintf("Delete destination '%s'?", d.Name), confirmDeleteDest, d.ID), nil
@@ -848,36 +936,43 @@ func (m Model) screenBeforeConfirm() Screen {
 	}
 }
 
-// switchTab switches to the given tab and loads its data if needed.
-func (m Model) switchTab(t Tab) Model {
+// switchTab switches to the given tab, loads its data if needed, and returns a
+// tea.Cmd that triggers the data fetch. Previously this returned only Model,
+// which meant the loading spinner appeared but no data was ever fetched until
+// the user manually pressed 'r'. Now the returned Cmd drives the initial load.
+func (m Model) switchTab(t Tab) (Model, tea.Cmd) {
 	m.tab = t
 	// Close any open sub-screens
 	m.jobDetail = nil
 	m.jobSettings = nil
 	m.sysSettings = nil
 
+	var cmd tea.Cmd
 	switch t {
 	case TabJobs:
 		m.screen = ScreenJobs
 		if len(m.jobList) == 0 {
 			m.jobs.SetLoading(true)
+			cmd = m.loadJobs()
 		}
 	case TabSources:
 		m.screen = ScreenSources
 		if len(m.srcList) == 0 {
 			m.sources.SetLoading(true)
+			cmd = m.loadSources()
 		}
 	case TabDestinations:
 		m.screen = ScreenDestinations
 		if len(m.dstList) == 0 {
 			m.destinations.SetLoading(true)
+			cmd = m.loadDests()
 		}
 	case TabSettings:
 		m.screen = ScreenSettings
 	case TabSystemSettings:
 		m.screen = ScreenSystemSettings
 	}
-	return m
+	return m, cmd
 }
 
 // openLogs loads task list and then opens the log viewer.
@@ -935,6 +1030,88 @@ func (m Model) openSystemSettings() (Model, tea.Cmd) {
 	return m, cmd
 }
 
+// openSourceCreate opens the source creation form.
+func (m Model) openSourceCreate() (Model, tea.Cmd) {
+	ef := ui.NewEntityFormModel(ui.EntityKindSource, m.width, m.height)
+	m.entityForm = &ef
+	m.screen = ScreenSourceForm
+	return m, ef.Init()
+}
+
+// openSourceEdit opens the source edit form pre-filled with existing data.
+func (m Model) openSourceEdit(s *service.Source) (Model, tea.Cmd) {
+	ef := ui.NewEntityFormModelEdit(ui.EntityKindSource, s.ID, s.Name, s.Type, s.Config, m.width, m.height)
+	m.entityForm = &ef
+	m.screen = ScreenSourceForm
+	return m, ef.Init()
+}
+
+// openDestCreate opens the destination creation form.
+func (m Model) openDestCreate() (Model, tea.Cmd) {
+	ef := ui.NewEntityFormModel(ui.EntityKindDest, m.width, m.height)
+	m.entityForm = &ef
+	m.screen = ScreenDestForm
+	return m, ef.Init()
+}
+
+// openDestEdit opens the destination edit form pre-filled with existing data.
+func (m Model) openDestEdit(d *service.Destination) (Model, tea.Cmd) {
+	ef := ui.NewEntityFormModelEdit(ui.EntityKindDest, d.ID, d.Name, d.Type, d.Config, m.width, m.height)
+	m.entityForm = &ef
+	m.screen = ScreenDestForm
+	return m, ef.Init()
+}
+
+// closeEntityForm navigates back to the appropriate list screen.
+func (m Model) closeEntityForm() Model {
+	m.entityForm = nil
+	if m.tab == TabSources {
+		m.screen = ScreenSources
+	} else {
+		m.screen = ScreenDestinations
+	}
+	return m
+}
+
+// handleEntityFormSubmit processes the entity form submission.
+func (m *Model) handleEntityFormSubmit(msg ui.EntityFormSubmitMsg) tea.Cmd {
+	svc := m.svc
+	eb := service.EntityBase{
+		Name:    msg.Name,
+		Type:    msg.Type,
+		Version: msg.Version,
+		Config:  msg.ConfigJSON,
+	}
+
+	switch msg.Kind {
+	case ui.EntityKindSource:
+		if msg.Mode == ui.EntityFormCreate {
+			return func() tea.Msg {
+				_, err := svc.CreateSource(eb)
+				return msgSourceCreated{err: err}
+			}
+		}
+		id := msg.ID
+		return func() tea.Msg {
+			_, err := svc.UpdateSource(id, eb)
+			return msgSourceUpdated{err: err}
+		}
+	case ui.EntityKindDest:
+		if msg.Mode == ui.EntityFormCreate {
+			return func() tea.Msg {
+				_, err := svc.CreateDestination(eb)
+				return msgDestCreated{err: err}
+			}
+		}
+		id := msg.ID
+		return func() tea.Msg {
+			_, err := svc.UpdateDestination(id, eb)
+			return msgDestUpdated{err: err}
+		}
+	}
+	return nil
+}
+
 // delegateUpdate forwards messages to sub-models.
 func (m Model) delegateUpdate(msg tea.Msg) tea.Cmd {
 	var cmd tea.Cmd
@@ -973,6 +1150,12 @@ func (m Model) delegateUpdate(msg tea.Msg) tea.Cmd {
 		if m.wizard != nil {
 			wzd, c := m.wizard.Update(msg)
 			m.wizard = &wzd
+			cmd = c
+		}
+	case ScreenSourceForm, ScreenDestForm:
+		if m.entityForm != nil {
+			ef, c := m.entityForm.Update(msg)
+			m.entityForm = &ef
 			cmd = c
 		}
 	}
@@ -1034,6 +1217,12 @@ func (m Model) View() string {
 
 	if m.screen == ScreenJobWizard && m.wizard != nil {
 		return m.wizard.View()
+	}
+
+	if (m.screen == ScreenSourceForm || m.screen == ScreenDestForm) && m.entityForm != nil {
+		header := m.renderHeader()
+		status := m.renderStatusBar()
+		return lipgloss.JoinVertical(lipgloss.Left, header, m.entityForm.View(), status)
 	}
 
 	// Compute available height for content (subtract header + status bar)
@@ -1143,6 +1332,8 @@ func (m Model) renderStatusBar() string {
 		hint = "1-5:tabs  a:add  e:edit  d:delete  t:test  r:refresh  q:quit"
 	case ScreenDestinations:
 		hint = "1-5:tabs  a:add  e:edit  d:delete  t:test  r:refresh  q:quit"
+	case ScreenSourceForm, ScreenDestForm:
+		hint = "tab/↑↓:move  ←→:change type  enter:next/submit  esc:back"
 	case ScreenJobLogs:
 		hint = "↑↓/pgup/pgdn:scroll  esc:back  q:quit"
 	default:

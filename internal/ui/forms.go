@@ -95,8 +95,23 @@ func (m FormModel) Update(msg tea.Msg) (FormModel, tea.Cmd) {
 				m.inputs[m.cursor].Focus()
 				return m, textinput.Blink
 			}
-			// Last field — submit
-			return m, m.submitCmd()
+			// Last field — validate and submit inline so err is set on returned copy.
+			values := make(map[string]string, len(m.fields))
+			valid := true
+			for i, f := range m.fields {
+				val := strings.TrimSpace(m.inputs[i].Value())
+				if f.Required && val == "" {
+					m.err = f.Label + " is required"
+					valid = false
+					break
+				}
+				values[f.Label] = val
+			}
+			if !valid {
+				return m, nil
+			}
+			captured := values
+			return m, func() tea.Msg { return FormSubmitMsg{Values: captured} }
 		case tea.KeyEsc:
 			return m, func() tea.Msg { return FormCancelMsg{} }
 		}
@@ -105,19 +120,6 @@ func (m FormModel) Update(msg tea.Msg) (FormModel, tea.Cmd) {
 	var cmd tea.Cmd
 	m.inputs[m.cursor], cmd = m.inputs[m.cursor].Update(msg)
 	return m, cmd
-}
-
-func (m FormModel) submitCmd() tea.Cmd {
-	values := make(map[string]string, len(m.fields))
-	for i, f := range m.fields {
-		val := strings.TrimSpace(m.inputs[i].Value())
-		if f.Required && val == "" {
-			m.err = f.Label + " is required"
-			return nil
-		}
-		values[f.Label] = val
-	}
-	return func() tea.Msg { return FormSubmitMsg{Values: values} }
 }
 
 // View renders the form.

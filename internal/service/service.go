@@ -392,6 +392,13 @@ func (m *Manager) CheckAuth() error {
 	return nil
 }
 
+// currentUserID returns the authenticated user's ID safely.
+func (m *Manager) currentUserID() int {
+	m.authMu.RLock()
+	defer m.authMu.RUnlock()
+	return m.userID
+}
+
 // ─── Sources ─────────────────────────────────────────────────────────────────
 
 // ListSources returns all sources for the project.
@@ -471,7 +478,7 @@ func (m *Manager) CreateSource(s EntityBase) (*EntityBase, error) {
 		INSERT INTO %s (name, type, version, config, project_id, created_by_id, updated_by_id, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $6, NOW(), NOW())`,
 		m.tbl("source"))
-	_, err = m.db.ExecContext(context.Background(), q, s.Name, s.Type, s.Version, encCfg, m.projectID, m.userID)
+	_, err = m.db.ExecContext(context.Background(), q, s.Name, s.Type, s.Version, encCfg, m.projectID, m.currentUserID())
 	if err != nil {
 		return nil, fmt.Errorf("create source: %w", err)
 	}
@@ -488,7 +495,7 @@ func (m *Manager) UpdateSource(id int, s EntityBase) (*Source, error) {
 		UPDATE %s SET name=$1, type=$2, version=$3, config=$4, updated_by_id=$5, updated_at=NOW()
 		WHERE id=$6`,
 		m.tbl("source"))
-	_, err = m.db.ExecContext(context.Background(), q, s.Name, s.Type, s.Version, encCfg, m.userID, id)
+	_, err = m.db.ExecContext(context.Background(), q, s.Name, s.Type, s.Version, encCfg, m.currentUserID(), id)
 	if err != nil {
 		return nil, fmt.Errorf("update source: %w", err)
 	}
@@ -509,7 +516,7 @@ func (m *Manager) DeleteSource(id int) error {
 	}
 	q := fmt.Sprintf(`UPDATE %s SET deleted_at=NOW(), updated_at=NOW(), updated_by_id=$2 WHERE id=$1 AND deleted_at IS NULL`, m.tbl("source"))
 	m.authMu.RLock()
-	uid := m.userID
+	uid := m.currentUserID()
 	m.authMu.RUnlock()
 	_, err = m.db.ExecContext(context.Background(), q, id, uid)
 	return err
@@ -601,7 +608,7 @@ func (m *Manager) CreateDestination(d EntityBase) (*EntityBase, error) {
 		INSERT INTO %s (name, type, version, config, project_id, created_by_id, updated_by_id, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $6, NOW(), NOW())`,
 		m.tbl("destination"))
-	_, err = m.db.ExecContext(context.Background(), q, d.Name, d.Type, d.Version, encCfg, m.projectID, m.userID)
+	_, err = m.db.ExecContext(context.Background(), q, d.Name, d.Type, d.Version, encCfg, m.projectID, m.currentUserID())
 	if err != nil {
 		return nil, fmt.Errorf("create destination: %w", err)
 	}
@@ -618,7 +625,7 @@ func (m *Manager) UpdateDestination(id int, d EntityBase) (*EntityBase, error) {
 		UPDATE %s SET name=$1, type=$2, version=$3, config=$4, updated_by_id=$5, updated_at=NOW()
 		WHERE id=$6`,
 		m.tbl("destination"))
-	_, err = m.db.ExecContext(context.Background(), q, d.Name, d.Type, d.Version, encCfg, m.userID, id)
+	_, err = m.db.ExecContext(context.Background(), q, d.Name, d.Type, d.Version, encCfg, m.currentUserID(), id)
 	if err != nil {
 		return nil, fmt.Errorf("update destination: %w", err)
 	}
@@ -637,7 +644,7 @@ func (m *Manager) DeleteDestination(id int) error {
 	}
 	q := fmt.Sprintf(`UPDATE %s SET deleted_at=NOW(), updated_at=NOW(), updated_by_id=$2 WHERE id=$1 AND deleted_at IS NULL`, m.tbl("destination"))
 	m.authMu.RLock()
-	uid := m.userID
+	uid := m.currentUserID()
 	m.authMu.RUnlock()
 	_, err = m.db.ExecContext(context.Background(), q, id, uid)
 	return err
@@ -782,7 +789,7 @@ func (m *Manager) DeleteJob(id int) error {
 	// Soft-delete the job record to match BFF behavior (sets deleted_at = NOW()).
 	q := fmt.Sprintf(`UPDATE %s SET deleted_at=NOW(), updated_at=NOW(), updated_by_id=$2 WHERE id=$1`, m.tbl("job"))
 	m.authMu.RLock()
-	uid := m.userID
+	uid := m.currentUserID()
 	m.authMu.RUnlock()
 	_, err = m.db.ExecContext(context.Background(), q, id, uid)
 	_ = job // referenced above
@@ -822,7 +829,7 @@ func (m *Manager) ActivateJob(id int, activate bool) error {
 	}
 
 	q := fmt.Sprintf(`UPDATE %s SET active=$1, updated_by_id=$2, updated_at=NOW() WHERE id=$3`, m.tbl("job"))
-	_, err := m.db.ExecContext(context.Background(), q, activate, m.userID, id)
+	_, err := m.db.ExecContext(context.Background(), q, activate, m.currentUserID(), id)
 	return err
 }
 
@@ -905,7 +912,7 @@ func (m *Manager) UpdateSettings(s SystemSettings) error {
 // UpdateJobMeta updates a job's name and frequency (schedule).
 func (m *Manager) UpdateJobMeta(id int, name, frequency string) error {
 	q := fmt.Sprintf(`UPDATE %s SET name=$1, frequency=$2, updated_by_id=$3, updated_at=NOW() WHERE id=$4`, m.tbl("job"))
-	_, err := m.db.ExecContext(context.Background(), q, name, frequency, m.userID, id)
+	_, err := m.db.ExecContext(context.Background(), q, name, frequency, m.currentUserID(), id)
 	return err
 }
 
@@ -964,75 +971,28 @@ type StreamConfig struct {
 	Selected    bool   `json:"selected"`
 }
 
-// DiscoverStreams returns streams for a source.
-// In direct-DB mode it tries to extract streams from an existing job that uses
-// the same source. If none exists, it returns an error advising the user.
+// DiscoverStreams returns the stream catalogue for a source by triggering discovery.
+//
+// The BFF implements discover by:
+//  1. Writing connector config to disk.
+//  2. Triggering a Temporal workflow that runs the olake CLI with the "discover" command.
+//  3. Reading the resulting catalog JSON produced by the CLI.
+//
+// The direct-DB mode cannot replicate this without a running Temporal worker and
+// the olake CLI. Reading streams_config from an existing job is INCORRECT because:
+//   - streams_config holds user-selected stream configs (not the full raw catalog).
+//   - For new sources with no jobs, there is nothing to read.
+//   - The data would be stale, missing new tables added to the source since the last sync.
+//
+// We therefore return an explicit error so callers know they must use the BFF.
 func (m *Manager) DiscoverStreams(sourceID int) ([]StreamInfo, error) {
-	q := fmt.Sprintf(
-		`SELECT streams_config FROM %s WHERE source_id=$1 AND streams_config IS NOT NULL AND streams_config <> '' LIMIT 1`,
-		m.tbl("job"))
-
-	var rawConfig string
-	err := m.db.QueryRowContext(context.Background(), q, sourceID).Scan(&rawConfig)
-	if err == sql.ErrNoRows || rawConfig == "" {
-		// No existing job → return a helpful error rather than silently empty
-		return nil, fmt.Errorf("no stream catalogue found for this source; " +
-			"run an initial sync via the BFF to populate the stream catalogue")
-	}
-	if err != nil {
-		return nil, fmt.Errorf("discover streams: %w", err)
-	}
-
-	// streams_config may be a JSON array of objects; attempt to extract names
-	var raw []map[string]interface{}
-	if err := json.Unmarshal([]byte(rawConfig), &raw); err != nil {
-		return nil, fmt.Errorf("parse streams config: %w", err)
-	}
-
-	seen := map[string]bool{}
-	var streams []StreamInfo
-	for _, obj := range raw {
-		ns, _ := obj["namespace"].(string)
-		name, _ := obj["name"].(string)
-		if name == "" {
-			name, _ = obj["stream_name"].(string)
-		}
-		if name == "" {
-			continue
-		}
-		key := ns + "." + name
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-
-		// Try to extract sync modes from the config; fall back to sensible defaults
-		modes := []string{"full_refresh", "incremental", "cdc"}
-		if sm, ok := obj["supported_sync_modes"].([]interface{}); ok {
-			modes = nil
-			for _, v := range sm {
-				if s, ok := v.(string); ok {
-					modes = append(modes, s)
-				}
-			}
-		}
-		// Cursor fields
-		var cursors []string
-		if cf, ok := obj["available_cursor_fields"].([]interface{}); ok {
-			for _, v := range cf {
-				if s, ok := v.(string); ok {
-					cursors = append(cursors, s)
-				}
-			}
-		}
-		streams = append(streams, StreamInfo{
-			Namespace:    ns,
-			Name:         name,
-			SyncModes:    modes,
-			CursorFields: cursors,
-		})
-	}
-	return streams, nil
+	return nil, fmt.Errorf(
+		"stream discovery requires a running Temporal worker and the olake CLI. " +
+			"In direct-DB mode, discovery is not supported. " +
+			"Please use the BFF API to discover streams first, then create jobs via the TUI. " +
+			"BFF endpoint: POST /api/v1/project/{projectid}/sources/%d/catalog",
+		sourceID,
+	)
 }
 
 // CreateJob inserts a new job record into the database.
@@ -1057,7 +1017,7 @@ func (m *Manager) CreateJob(name string, sourceID, destID int, frequency string,
 	var jobID int
 	err = m.db.QueryRowContext(context.Background(), q,
 		name, sourceID, destID, frequency, true, string(streamsJSON),
-		m.projectID, m.userID,
+		m.projectID, m.currentUserID(),
 	).Scan(&jobID)
 	if err != nil {
 		return nil, fmt.Errorf("create job: %w", err)
