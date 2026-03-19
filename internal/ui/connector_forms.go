@@ -169,13 +169,29 @@ func ParseConfigJSON(configJSON string) map[string]string {
 	return out
 }
 
+// numericFields lists config keys that should be serialised as JSON numbers
+// rather than strings, matching the BFF's expected schema.
+var numericFields = map[string]bool{
+	"port": true,
+}
+
 // BuildConfigJSON serializes a flat field→value map to a JSON config string.
+// Fields listed in numericFields are emitted as numbers if parseable.
 func BuildConfigJSON(values map[string]string) string {
 	out := make(map[string]interface{}, len(values))
 	for k, v := range values {
-		if v != "" {
-			out[k] = v
+		if v == "" {
+			continue
 		}
+		if numericFields[k] {
+			var n json.Number
+			n = json.Number(v)
+			if _, err := n.Int64(); err == nil {
+				out[k] = n
+				continue
+			}
+		}
+		out[k] = v
 	}
 	b, err := json.Marshal(out)
 	if err != nil {

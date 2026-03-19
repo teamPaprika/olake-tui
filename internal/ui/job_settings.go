@@ -110,7 +110,7 @@ func cronDescription(cron string) string {
 }
 
 func padZero(s string) string {
-	if len(s) == 1 {
+	if len(s) == 1 && s[0] >= '0' && s[0] <= '9' {
 		return "0" + s
 	}
 	return s

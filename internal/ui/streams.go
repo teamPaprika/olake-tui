@@ -313,7 +313,7 @@ func (m *StreamsModel) rebuildFilter() {
 		}
 	}
 	if m.cursor >= len(m.filtered) {
-		m.cursor = max(0, len(m.filtered)-1)
+		m.cursor = maxInt(0, len(m.filtered)-1)
 	}
 	m.clampScroll()
 }
@@ -327,7 +327,9 @@ func (m *StreamsModel) clampScroll() {
 	}
 }
 
-func max(a, b int) int {
+// maxInt returns the larger of two ints.
+// Named maxInt to avoid shadowing the Go 1.21+ builtin max.
+func maxInt(a, b int) int {
 	if a > b {
 		return a
 	}

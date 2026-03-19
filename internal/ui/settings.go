@@ -160,7 +160,8 @@ func (m SettingsModel) View() string {
 
 	// ── Version info ──────────────────────────────────────────────────────────
 	sb.WriteString(StyleMuted.Render(strings.Repeat("─", 60)) + "\n")
-	sb.WriteString(StyleMuted.Render(fmt.Sprintf("  olake-tui v%s", m.version)) + "\n\n")
+	ver := strings.TrimPrefix(m.version, "v")
+	sb.WriteString(StyleMuted.Render(fmt.Sprintf("  olake-tui v%s", ver)) + "\n\n")
 
 	// ── Help ──────────────────────────────────────────────────────────────────
 	sb.WriteString(StyleHelp.Render("tab/↑↓: navigate  •  enter: activate  •  esc: cancel"))

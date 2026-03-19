@@ -893,7 +893,7 @@ func (m *Manager) ActivateJob(id int, activate bool) error {
 		}
 	}
 
-	q := fmt.Sprintf(`UPDATE %s SET active=$1, updated_by_id=$2, updated_at=NOW() WHERE id=$3`, m.tbl("job"))
+	q := fmt.Sprintf(`UPDATE %s SET active=$1, updated_by_id=$2, updated_at=NOW() WHERE id=$3 AND deleted_at IS NULL`, m.tbl("job"))
 	_, err := m.db.ExecContext(context.Background(), q, activate, m.currentUserID(), id)
 	return err
 }
@@ -975,7 +975,7 @@ func (m *Manager) UpdateSettings(s SystemSettings) error {
 
 // UpdateJobMeta updates a job's name and frequency (schedule).
 func (m *Manager) UpdateJobMeta(id int, name, frequency string) error {
-	q := fmt.Sprintf(`UPDATE %s SET name=$1, frequency=$2, updated_by_id=$3, updated_at=NOW() WHERE id=$4`, m.tbl("job"))
+	q := fmt.Sprintf(`UPDATE %s SET name=$1, frequency=$2, updated_by_id=$3, updated_at=NOW() WHERE id=$4 AND deleted_at IS NULL`, m.tbl("job"))
 	_, err := m.db.ExecContext(context.Background(), q, name, frequency, m.currentUserID(), id)
 	return err
 }

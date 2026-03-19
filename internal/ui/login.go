@@ -98,11 +98,22 @@ func (m LoginModel) Update(msg tea.Msg) (LoginModel, tea.Cmd) {
 				m.usernameInput.Blur()
 				return m, textinput.Blink
 			}
+			// Validate before submitting
+			username := strings.TrimSpace(m.usernameInput.Value())
+			password := m.passwordInput.Value()
+			if username == "" {
+				m.err = "Username is required"
+				return m, nil
+			}
+			if password == "" {
+				m.err = "Password is required"
+				return m, nil
+			}
 			// Submit
 			return m, func() tea.Msg {
 				return LoginMsg{
-					Username: strings.TrimSpace(m.usernameInput.Value()),
-					Password: m.passwordInput.Value(),
+					Username: username,
+					Password: password,
 				}
 			}
 		}

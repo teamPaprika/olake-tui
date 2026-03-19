@@ -112,7 +112,7 @@ func NewEntityFormModelEdit(kind EntityKind, id int, name, connType, configJSON 
 	// Build connection form pre-filled
 	prefill := ParseConfigJSON(configJSON)
 	connFields := connectorFields(kind, types[idx], prefill)
-	cf := NewFormModel(fmt.Sprintf("%s Connection", strings.Title(types[idx])), connFields)
+	cf := NewFormModel(fmt.Sprintf("%s Connection", displayConnType(types[idx])), connFields)
 
 	return EntityFormModel{
 		kind:           kind,
@@ -433,6 +433,9 @@ func displayConnType(t string) string {
 	case ConnectorParquet:
 		return "Amazon S3 (Parquet)"
 	default:
-		return strings.Title(t)
+		if len(t) > 0 {
+			return strings.ToUpper(t[:1]) + t[1:]
+		}
+		return t
 	}
 }
