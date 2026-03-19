@@ -4,3 +4,5 @@ bin/
 olake-tui
 _olake-ui-ref/
 src-rust-archive/
+olake-tui
+bin/
