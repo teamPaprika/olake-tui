@@ -40,6 +40,10 @@ func main() {
 		runMode       = flag.String("run-mode", envOr("OLAKE_RUN_MODE", service.DefaultRunMode), "Beego run mode (dev|prod|staging)")
 		encryptionKey = flag.String("encryption-key", envOr("OLAKE_SECRET_KEY", ""), "AES encryption key")
 		showVersion   = flag.Bool("version", false, "Print version and exit")
+		migrate       = flag.Bool("migrate", false, "Create OLake tables if they don't exist, seed admin user, then start TUI")
+		migrateOnly   = flag.Bool("migrate-only", false, "Run migration and exit (don't start TUI)")
+		adminUser     = flag.String("admin-user", envOr("OLAKE_ADMIN_USER", "admin"), "Admin username for initial seed")
+		adminPass     = flag.String("admin-pass", envOr("OLAKE_ADMIN_PASSWORD", "admin"), "Admin password for initial seed")
 	)
 	flag.Parse()
 
@@ -67,6 +71,28 @@ func main() {
 		os.Exit(1)
 	}
 	defer svc.Close()
+
+	// Run migration if requested
+	if *migrate || *migrateOnly {
+		fmt.Println("Running database migration...")
+		if err := svc.MigrateSchema(); err != nil {
+			fmt.Fprintf(os.Stderr, "Migration failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("✓ Schema migration complete")
+
+		fmt.Printf("Seeding admin user (%s)...\n", *adminUser)
+		if err := svc.SeedAdminUser(*adminUser, *adminPass); err != nil {
+			fmt.Fprintf(os.Stderr, "Admin seed failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("✓ Admin user ready")
+
+		if *migrateOnly {
+			fmt.Println("Migration complete. Exiting.")
+			os.Exit(0)
+		}
+	}
 
 	// Create root model (version injected at build time via ldflags)
 	model := app.New(svc, version)
