@@ -354,3 +354,157 @@ func TestMockServiceValidateSchema(t *testing.T) {
 		t.Error("expected schema validation error, got nil")
 	}
 }
+
+// ─── IsNameUnique tests ───────────────────────────────────────────────────────
+
+func TestMockIsNameUnique_Default(t *testing.T) {
+	m := NewMockService()
+	ok, err := m.IsNameUnique("job", "any-name")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok {
+		t.Error("default mock should return true (unique)")
+	}
+}
+
+func TestMockIsNameUnique_ErrorInjection(t *testing.T) {
+	m := NewMockService()
+	m.IsNameUniqueErr = errBadCredentials{}
+	_, err := m.IsNameUnique("source", "test")
+	if err == nil {
+		t.Error("expected error from injected IsNameUniqueErr")
+	}
+}
+
+func TestMockIsNameUnique_CallCounting(t *testing.T) {
+	m := NewMockService()
+	_, _ = m.IsNameUnique("job", "a")
+	_, _ = m.IsNameUnique("source", "b")
+	if m.Calls["IsNameUnique"] != 2 {
+		t.Errorf("want 2 calls, got %d", m.Calls["IsNameUnique"])
+	}
+}
+
+// ─── UpdateJobFull tests ──────────────────────────────────────────────────────
+
+func TestMockUpdateJobFull_Success(t *testing.T) {
+	m := NewMockService()
+	m.Jobs = []Job{{ID: 1, Name: "old", Frequency: "0 * * * *", Activate: true}}
+
+	err := m.UpdateJobFull(1, "new-name", 10, 20, "*/5 * * * *",
+		[]StreamConfig{{Name: "users", Selected: true}}, false, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify mock updated the job
+	job, _ := m.GetJob(1)
+	if job.Name != "new-name" {
+		t.Errorf("name not updated: %q", job.Name)
+	}
+	if job.Frequency != "*/5 * * * *" {
+		t.Errorf("frequency not updated: %q", job.Frequency)
+	}
+	if job.Activate {
+		t.Error("activate should be false")
+	}
+}
+
+func TestMockUpdateJobFull_NotFound(t *testing.T) {
+	m := NewMockService()
+	err := m.UpdateJobFull(999, "x", 1, 2, "", nil, true, nil)
+	if err == nil {
+		t.Error("expected error for non-existent job")
+	}
+}
+
+func TestMockUpdateJobFull_ErrorInjection(t *testing.T) {
+	m := NewMockService()
+	m.Jobs = []Job{{ID: 1, Name: "test"}}
+	m.UpdateJobFullErr = errBadCredentials{}
+
+	err := m.UpdateJobFull(1, "x", 1, 2, "", nil, true, nil)
+	if err == nil {
+		t.Error("expected injected error")
+	}
+}
+
+// ─── GetClearDestStatus tests ─────────────────────────────────────────────────
+
+func TestMockGetClearDestStatus_Default(t *testing.T) {
+	m := NewMockService()
+	running, err := m.GetClearDestStatus(1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if running {
+		t.Error("default should be not running")
+	}
+}
+
+func TestMockGetClearDestStatus_Running(t *testing.T) {
+	m := NewMockService()
+	m.ClearDestRunning = true
+	running, _ := m.GetClearDestStatus(1)
+	if !running {
+		t.Error("should report running when ClearDestRunning=true")
+	}
+}
+
+func TestMockGetClearDestStatus_ErrorInjection(t *testing.T) {
+	m := NewMockService()
+	m.GetClearDestStatusErr = errBadCredentials{}
+	_, err := m.GetClearDestStatus(1)
+	if err == nil {
+		t.Error("expected injected error")
+	}
+}
+
+// ─── RecoverFromClearDest tests ───────────────────────────────────────────────
+
+func TestMockRecoverFromClearDest_Success(t *testing.T) {
+	m := NewMockService()
+	if err := m.RecoverFromClearDest(1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if m.Calls["RecoverFromClearDest"] != 1 {
+		t.Error("call not recorded")
+	}
+}
+
+func TestMockRecoverFromClearDest_ErrorInjection(t *testing.T) {
+	m := NewMockService()
+	m.RecoverFromClearDestErr = errBadCredentials{}
+	if err := m.RecoverFromClearDest(1); err == nil {
+		t.Error("expected injected error")
+	}
+}
+
+// ─── RunMode validation tests ─────────────────────────────────────────────────
+
+func TestNewManager_InvalidRunMode(t *testing.T) {
+	_, err := New(Config{
+		DBURL:   "postgres://fake:fake@localhost/fake",
+		RunMode: "invalid-mode",
+	})
+	if err == nil {
+		t.Error("expected error for invalid run mode")
+	}
+	if !strings.Contains(err.Error(), "invalid run mode") {
+		t.Errorf("error should mention invalid run mode, got: %v", err)
+	}
+}
+
+func TestNewManager_ValidRunModes(t *testing.T) {
+	for _, mode := range []string{"dev", "prod", "staging"} {
+		// This will fail on DB connect but should pass the runMode check
+		_, err := New(Config{
+			DBURL:   "postgres://fake:fake@localhost:0/fake?connect_timeout=1",
+			RunMode: mode,
+		})
+		if err != nil && strings.Contains(err.Error(), "invalid run mode") {
+			t.Errorf("mode %q should be valid but got: %v", mode, err)
+		}
+	}
+}

@@ -235,6 +235,258 @@ func loginModel(m Model) Model {
 	return m2
 }
 
+// ─── Modal confirm flow: delete job ───────────────────────────────────────────
+
+func TestModalDeleteJob_Confirm(t *testing.T) {
+	m, _ := newTestModel()
+	m = loginModel(m)
+
+	// Load jobs
+	m, _ = update(m, msgJobsLoaded{jobs: m.svc.(*service.MockService).Jobs})
+
+	// Show delete modal for job 100
+	newM, cmd := m.showDeleteJobModal("nightly-sync", 100, false)
+	m = newM
+	_ = cmd
+
+	if !m.modalState.Active() {
+		t.Fatal("modal should be active after showDeleteJobModal")
+	}
+	if m.modalCtx != modalCtxDeleteJob {
+		t.Errorf("modal context should be modalCtxDeleteJob, got %v", m.modalCtx)
+	}
+	if m.modalID != 100 {
+		t.Errorf("modal ID should be 100, got %d", m.modalID)
+	}
+}
+
+func TestModalDeleteJob_ConfirmExecutes(t *testing.T) {
+	m, mock := newTestModel()
+	m = loginModel(m)
+	m, _ = update(m, msgJobsLoaded{jobs: mock.Jobs})
+
+	// After deletion message, jobs reload
+	m2, _ := update(m, msgJobDeleted{err: nil})
+	_ = m2 // no panic = pass
+}
+
+// ─── Source/Dest delete flow ──────────────────────────────────────────────────
+
+func TestSourceDeleted_ReloadsSourceList(t *testing.T) {
+	m, _ := newTestModel()
+	m = loginModel(m)
+
+	m2, cmd := update(m, msgSourceDeleted{err: nil})
+	if cmd == nil {
+		t.Error("source deleted should trigger reload command")
+	}
+	_ = m2
+}
+
+func TestDestDeleted_ReloadsDestList(t *testing.T) {
+	m, _ := newTestModel()
+	m = loginModel(m)
+
+	m2, cmd := update(m, msgDestDeleted{err: nil})
+	if cmd == nil {
+		t.Error("dest deleted should trigger reload command")
+	}
+	_ = m2
+}
+
+// ─── Sync / Cancel / Activate results ─────────────────────────────────────────
+
+func TestSyncTriggered_Success(t *testing.T) {
+	m, _ := newTestModel()
+	m = loginModel(m)
+
+	m2, cmd := update(m, msgSyncTriggered{err: nil})
+	// Toast is delivered via Cmd → msgShowToast
+	if cmd == nil {
+		t.Fatal("sync success should return a toast command")
+	}
+	toastMsg := runCmd(cmd)
+	m3, _ := update(m2, toastMsg)
+	if m3.toast == "" {
+		t.Error("sync success should show a toast")
+	}
+}
+
+func TestSyncTriggered_Error(t *testing.T) {
+	m, _ := newTestModel()
+	m = loginModel(m)
+
+	m2, cmd := update(m, msgSyncTriggered{err: errTest("sync failed")})
+	if cmd == nil {
+		t.Fatal("sync error should return a toast command")
+	}
+	toastMsg := runCmd(cmd)
+	m3, _ := update(m2, toastMsg)
+	if !m3.toastError {
+		t.Error("sync failure should show error toast")
+	}
+}
+
+func TestCancelDone_Success(t *testing.T) {
+	m, _ := newTestModel()
+	m = loginModel(m)
+
+	m2, cmd := update(m, msgCancelDone{err: nil})
+	if cmd == nil {
+		t.Fatal("cancel success should return a toast command")
+	}
+	toastMsg := runCmd(cmd)
+	m3, _ := update(m2, toastMsg)
+	if m3.toast == "" {
+		t.Error("cancel success should show a toast")
+	}
+}
+
+func TestActivateDone_Success(t *testing.T) {
+	m, _ := newTestModel()
+	m = loginModel(m)
+
+	m2, cmd := update(m, msgActivateDone{err: nil})
+	if cmd == nil {
+		t.Error("activate success should reload jobs")
+	}
+	_ = m2
+}
+
+// ─── Job settings messages ────────────────────────────────────────────────────
+
+func TestJobSettingsSaved_Success(t *testing.T) {
+	m, _ := newTestModel()
+	m = loginModel(m)
+
+	// Open job settings first
+	m2, _ := m.openJobSettings(service.Job{ID: 100, Name: "test"})
+	if m2.screen != ScreenJobSettings {
+		t.Fatalf("expected ScreenJobSettings, got %v", m2.screen)
+	}
+
+	// Simulate save result
+	m3, _ := update(m2, msgJobSettingsSaved{err: nil})
+	if m3.screen != ScreenJobs {
+		t.Errorf("after save, should return to ScreenJobs, got %v", m3.screen)
+	}
+	if m3.jobSettings != nil {
+		t.Error("jobSettings should be nil after save")
+	}
+}
+
+func TestJobSettingsSaved_Error(t *testing.T) {
+	m, _ := newTestModel()
+	m = loginModel(m)
+
+	m2, cmd := update(m, msgJobSettingsSaved{err: errTest("save failed")})
+	if cmd == nil {
+		t.Fatal("save error should return a toast command")
+	}
+	toastMsg := runCmd(cmd)
+	m3, _ := update(m2, toastMsg)
+	if !m3.toastError {
+		t.Error("save failure should show error toast")
+	}
+}
+
+// ─── Settings loaded / saved ──────────────────────────────────────────────────
+
+func TestSettingsLoaded(t *testing.T) {
+	m, _ := newTestModel()
+	m = loginModel(m)
+
+	// Open system settings
+	m2, _ := m.openSystemSettings()
+	if m2.sysSettings == nil {
+		t.Fatal("sysSettings should be set after openSystemSettings")
+	}
+
+	// Simulate settings response
+	m3, _ := update(m2, msgSettingsLoaded{settings: &service.SystemSettings{WebhookAlertURL: "https://test.com"}})
+	_ = m3 // no panic = pass
+}
+
+func TestSettingsSaved_Success(t *testing.T) {
+	m, _ := newTestModel()
+	m = loginModel(m)
+
+	m2, cmd := update(m, msgSettingsSaved{err: nil})
+	if cmd == nil {
+		t.Fatal("settings saved should return a toast command")
+	}
+	toastMsg := runCmd(cmd)
+	m3, _ := update(m2, toastMsg)
+	if m3.toast == "" {
+		t.Error("settings saved should show toast")
+	}
+}
+
+// ─── Tab switching ────────────────────────────────────────────────────────────
+
+func TestTabSwitch_Sources(t *testing.T) {
+	m, _ := newTestModel()
+	m = loginModel(m)
+
+	m2, _ := m.switchTab(TabSources)
+	if m2.tab != TabSources {
+		t.Errorf("expected TabSources, got %v", m2.tab)
+	}
+	if m2.screen != ScreenSources {
+		t.Errorf("expected ScreenSources, got %v", m2.screen)
+	}
+}
+
+func TestTabSwitch_Destinations(t *testing.T) {
+	m, _ := newTestModel()
+	m = loginModel(m)
+
+	m2, _ := m.switchTab(TabDestinations)
+	if m2.tab != TabDestinations {
+		t.Errorf("expected TabDestinations, got %v", m2.tab)
+	}
+}
+
+func TestTabSwitch_Settings(t *testing.T) {
+	m, _ := newTestModel()
+	m = loginModel(m)
+
+	m2, _ := m.switchTab(TabSettings)
+	if m2.tab != TabSettings {
+		t.Errorf("expected TabSettings, got %v", m2.tab)
+	}
+	if m2.sysSettings == nil {
+		t.Error("settings tab should open system settings")
+	}
+}
+
+// ─── Clear destination result ─────────────────────────────────────────────────
+
+func TestClearDestDone_Success(t *testing.T) {
+	m, _ := newTestModel()
+	m = loginModel(m)
+
+	m2, _ := update(m, msgClearDestDone{err: nil})
+	if m2.screen != ScreenJobs {
+		t.Errorf("after clear dest, should go to ScreenJobs, got %v", m2.screen)
+	}
+}
+
+func TestClearDestDone_Error(t *testing.T) {
+	m, _ := newTestModel()
+	m = loginModel(m)
+
+	m2, cmd := update(m, msgClearDestDone{err: errTest("clear failed")})
+	if cmd == nil {
+		t.Fatal("clear dest error should return a toast command")
+	}
+	toastMsg := runCmd(cmd)
+	m3, _ := update(m2, toastMsg)
+	if !m3.toastError {
+		t.Error("clear dest failure should show error toast")
+	}
+}
+
 // ─── Test error type ──────────────────────────────────────────────────────────
 
 type errTest string
