@@ -536,6 +536,13 @@ func (m *Manager) GetSource(id int) (*Source, error) {
 
 // CreateSource creates a new source.
 func (m *Manager) CreateSource(s EntityBase) (*EntityBase, error) {
+	unique, err := m.IsNameUnique("source", s.Name)
+	if err != nil {
+		return nil, fmt.Errorf("check source name uniqueness: %w", err)
+	}
+	if !unique {
+		return nil, fmt.Errorf("source name %q already exists in this project", s.Name)
+	}
 	encCfg, err := m.encrypt(s.Config)
 	if err != nil {
 		return nil, fmt.Errorf("encrypt source config: %w", err)
@@ -665,6 +672,13 @@ func (m *Manager) GetDestination(id int) (*Destination, error) {
 
 // CreateDestination creates a new destination.
 func (m *Manager) CreateDestination(d EntityBase) (*EntityBase, error) {
+	unique, err := m.IsNameUnique("destination", d.Name)
+	if err != nil {
+		return nil, fmt.Errorf("check destination name uniqueness: %w", err)
+	}
+	if !unique {
+		return nil, fmt.Errorf("destination name %q already exists in this project", d.Name)
+	}
 	encCfg, err := m.encrypt(d.Config)
 	if err != nil {
 		return nil, fmt.Errorf("encrypt destination config: %w", err)
@@ -758,7 +772,34 @@ func (m *Manager) ListJobs() ([]Job, error) {
 	if jobs == nil {
 		jobs = []Job{}
 	}
-	return jobs, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Enrich jobs with real-time Temporal status (best-effort, 5s total cap).
+	if m.temporal != nil && len(jobs) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		for i := range jobs {
+			select {
+			case <-ctx.Done():
+				break // timeout — use DB-cached values for remaining jobs
+			default:
+			}
+			status, startTime, runType := m.fetchJobLastRun(jobs[i].ID)
+			if status != "" {
+				jobs[i].LastRunState = status
+			}
+			if startTime != "" {
+				jobs[i].LastRunTime = startTime
+			}
+			if runType != "" {
+				jobs[i].LastRunType = runType
+			}
+		}
+	}
+
+	return jobs, nil
 }
 
 // GetJob returns a single job by ID.
@@ -1568,6 +1609,14 @@ func (m *Manager) CreateJob(name string, sourceID, destID int, frequency string,
 		frequency = "0 * * * *" // every hour default
 	}
 
+	unique, err := m.IsNameUnique("job", name)
+	if err != nil {
+		return nil, fmt.Errorf("check job name uniqueness: %w", err)
+	}
+	if !unique {
+		return nil, fmt.Errorf("job name %q already exists in this project", name)
+	}
+
 	streamsJSON, err := json.Marshal(streams)
 	if err != nil {
 		return nil, fmt.Errorf("marshal streams: %w", err)
@@ -1654,4 +1703,170 @@ func (m *Manager) CreateJob(name string, sourceID, destID int, frequency string,
 	}
 
 	return m.GetJob(jobID)
+}
+
+// ─── Name Uniqueness ─────────────────────────────────────────────────────────
+
+// IsNameUnique checks whether a name is unique within the project for a given
+// entity type ("job", "source", or "destination").
+func (m *Manager) IsNameUnique(entityType string, name string) (bool, error) {
+	var table string
+	switch entityType {
+	case "job":
+		table = m.tbl("job")
+	case "source":
+		table = m.tbl("source")
+	case "destination":
+		table = m.tbl("destination")
+	default:
+		return false, fmt.Errorf("invalid entity type: %s", entityType)
+	}
+	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE name=$1 AND project_id=$2 AND deleted_at IS NULL`, table)
+	var count int
+	err := m.db.QueryRowContext(context.Background(), q, name, m.projectID).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("check name uniqueness: %w", err)
+	}
+	return count == 0, nil
+}
+
+// ─── Clear Destination Status & Recovery ─────────────────────────────────────
+
+// GetClearDestStatus reports whether a clear-destination workflow is currently
+// running for the given job.
+func (m *Manager) GetClearDestStatus(jobID int) (bool, error) {
+	if m.temporal == nil {
+		return false, fmt.Errorf("temporal client not connected")
+	}
+	workflowID, _ := m.workflowAndScheduleID(m.projectID, jobID)
+	query := fmt.Sprintf("WorkflowId = '%s' AND ExecutionStatus = 'Running'", workflowID)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := m.temporal.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{Query: query})
+	if err != nil {
+		return false, fmt.Errorf("list workflows: %w", err)
+	}
+	for _, exec := range resp.GetExecutions() {
+		if exec.GetStatus() == enums.WORKFLOW_EXECUTION_STATUS_RUNNING {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// RecoverFromClearDest cancels stuck clear-destination workflows and restores
+// the normal sync schedule for a job.
+func (m *Manager) RecoverFromClearDest(jobID int) error {
+	if m.temporal == nil {
+		return fmt.Errorf("temporal client not connected")
+	}
+
+	job, err := m.GetJob(jobID)
+	if err != nil {
+		return fmt.Errorf("get job: %w", err)
+	}
+
+	workflowID, scheduleID := m.workflowAndScheduleID(m.projectID, jobID)
+	ctx := context.Background()
+
+	// 1. Cancel any running workflows for this job.
+	_ = m.temporal.CancelWorkflow(ctx, workflowID, "")
+
+	// 2. Restore schedule to normal sync workflow.
+	syncReq := m.buildSyncRequest(job, workflowID)
+	if err := m.updateSchedule(ctx, job.Frequency, jobID, syncReq); err != nil {
+		return fmt.Errorf("restore sync schedule: %w", err)
+	}
+
+	// 3. Resume the schedule.
+	handle := m.temporal.ScheduleClient().GetHandle(ctx, scheduleID)
+	if err := handle.Unpause(ctx, client.ScheduleUnpauseOptions{Note: "recovered from clear-destination"}); err != nil {
+		return fmt.Errorf("resume schedule: %w", err)
+	}
+
+	return nil
+}
+
+// ─── Full Job Update ─────────────────────────────────────────────────────────
+
+// UpdateJobFull updates all job fields, matching the BFF's UpdateJob behaviour.
+// It blocks when clear-destination is running, cancels any in-flight sync, and
+// updates the Temporal schedule if the frequency changes.
+func (m *Manager) UpdateJobFull(id int, name string, sourceID, destID int, frequency string, streams []StreamConfig, activate bool, advancedSettings *AdvancedSettings) error {
+	// 1. Check if clear-destination is running.
+	if m.temporal != nil {
+		running, err := m.GetClearDestStatus(id)
+		if err == nil && running {
+			return fmt.Errorf("clear-destination is in progress, cannot update job")
+		}
+	}
+
+	// 2. Cancel any running sync workflows.
+	if m.temporal != nil {
+		workflowID, _ := m.workflowAndScheduleID(m.projectID, id)
+		_ = m.temporal.CancelWorkflow(context.Background(), workflowID, "")
+	}
+
+	// 3. Serialize streams and advanced settings.
+	streamsJSON, err := json.Marshal(streams)
+	if err != nil {
+		return fmt.Errorf("marshal streams: %w", err)
+	}
+	var advJSON sql.NullString
+	if advancedSettings != nil {
+		b, err := json.Marshal(advancedSettings)
+		if err != nil {
+			return fmt.Errorf("marshal advanced settings: %w", err)
+		}
+		advJSON = sql.NullString{String: string(b), Valid: true}
+	}
+
+	// 4. Update all fields in DB.
+	q := fmt.Sprintf(`
+		UPDATE %s
+		SET name=$1, source_id=$2, dest_id=$3, frequency=$4,
+		    streams_config=$5, active=$6, advanced_settings=$7,
+		    updated_by_id=$8, updated_at=NOW()
+		WHERE id=$9 AND deleted_at IS NULL`, m.tbl("job"))
+	_, err = m.db.ExecContext(context.Background(), q,
+		name, sourceID, destID, frequency,
+		string(streamsJSON), activate, advJSON,
+		m.currentUserID(), id)
+	if err != nil {
+		return fmt.Errorf("update job: %w", err)
+	}
+
+	// 5. Update Temporal schedule if frequency changed.
+	if m.temporal != nil {
+		job, err := m.GetJob(id)
+		if err == nil {
+			workflowID, _ := m.workflowAndScheduleID(m.projectID, id)
+			syncReq := m.buildSyncRequest(job, workflowID)
+			_ = m.updateSchedule(context.Background(), frequency, id, syncReq)
+		}
+	}
+
+	return nil
+}
+
+// ─── Real-time Job Status from Temporal ──────────────────────────────────────
+
+// fetchJobLastRun queries Temporal for the latest workflow execution of a job
+// and returns the status, start time, and run type. Returns zero values on any
+// error so callers can silently fall back to DB-cached values.
+func (m *Manager) fetchJobLastRun(jobID int) (status, startTime, runType string) {
+	if m.temporal == nil {
+		return "", "", ""
+	}
+	workflowID := fmt.Sprintf("sync-%s-%d", m.projectID, jobID)
+	query := fmt.Sprintf("WorkflowId BETWEEN '%s-' AND '%s-z'", workflowID, workflowID)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	resp, err := m.temporal.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{Query: query})
+	if err != nil || len(resp.GetExecutions()) == 0 {
+		return "", "", ""
+	}
+	exec := resp.GetExecutions()[0]
+	st := exec.GetStartTime().AsTime().UTC().Format(time.RFC3339)
+	return exec.GetStatus().String(), st, "sync"
 }

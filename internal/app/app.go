@@ -483,6 +483,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 		}
 
+	case ui.JobSettingsRecoverMsg:
+		jobID := msg.JobID
+		return m, func() tea.Msg {
+			err := m.svc.RecoverFromClearDest(jobID)
+			if err != nil {
+				return msgShowToast{msg: "Recovery failed: " + err.Error(), isErr: true}
+			}
+			return msgShowToast{msg: "Recovery complete — schedule restored", isErr: false}
+		}
+
 	case ui.JobSettingsDeleteMsg:
 		if m.jobSettings != nil {
 			j := m.jobSettings.Job()

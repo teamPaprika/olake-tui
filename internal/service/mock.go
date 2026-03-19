@@ -33,6 +33,9 @@ type MockService struct {
 	Streams      []StreamInfo
 	TestResult   *TestConnectionResult
 
+	// ── Pre-canned flags ──────────────────────────────────────────────────
+	ClearDestRunning bool
+
 	// ── Error injection ───────────────────────────────────────────────────
 	LoginErr           error
 	ListSourcesErr     error
@@ -59,9 +62,13 @@ type MockService struct {
 	ListTasksErr       error
 	GetTaskLogsErr     error
 	ClearDestErr       error
-	GetSettingsErr     error
-	UpdateSettingsErr  error
-	ValidateSchemaErr  error
+	GetSettingsErr          error
+	UpdateSettingsErr       error
+	ValidateSchemaErr       error
+	IsNameUniqueErr         error
+	GetClearDestStatusErr   error
+	RecoverFromClearDestErr error
+	UpdateJobFullErr        error
 
 	// ── Call counters (useful for assertions) ─────────────────────────────
 	Calls map[string]int
@@ -464,6 +471,51 @@ func (m *MockService) ValidateSchema() error {
 
 func (m *MockService) GetCompatibleVersion() string {
 	return "olake >= 1.0.0 (mock)"
+}
+
+// ── Name Uniqueness ───────────────────────────────────────────────────────────
+
+func (m *MockService) IsNameUnique(entityType string, name string) (bool, error) {
+	m.record("IsNameUnique")
+	if m.IsNameUniqueErr != nil {
+		return false, m.IsNameUniqueErr
+	}
+	return true, nil
+}
+
+// ── Clear Destination Status ──────────────────────────────────────────────────
+
+func (m *MockService) GetClearDestStatus(jobID int) (bool, error) {
+	m.record("GetClearDestStatus")
+	if m.GetClearDestStatusErr != nil {
+		return false, m.GetClearDestStatusErr
+	}
+	return m.ClearDestRunning, nil
+}
+
+func (m *MockService) RecoverFromClearDest(jobID int) error {
+	m.record("RecoverFromClearDest")
+	return m.RecoverFromClearDestErr
+}
+
+// ── Full Job Update ───────────────────────────────────────────────────────────
+
+func (m *MockService) UpdateJobFull(id int, name string, sourceID, destID int, frequency string, streams []StreamConfig, activate bool, advancedSettings *AdvancedSettings) error {
+	m.record("UpdateJobFull")
+	if m.UpdateJobFullErr != nil {
+		return m.UpdateJobFullErr
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.Jobs {
+		if m.Jobs[i].ID == id {
+			m.Jobs[i].Name = name
+			m.Jobs[i].Frequency = frequency
+			m.Jobs[i].Activate = activate
+			return nil
+		}
+	}
+	return fmt.Errorf("job not found id[%d]", id)
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────

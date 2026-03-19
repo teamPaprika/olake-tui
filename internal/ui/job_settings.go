@@ -140,6 +140,9 @@ type JobSettingsClearDestMsg struct{ JobID int }
 // JobSettingsDeleteMsg is fired to delete the job.
 type JobSettingsDeleteMsg struct{ JobID int }
 
+// JobSettingsRecoverMsg is fired to recover from a stuck clear-destination.
+type JobSettingsRecoverMsg struct{ JobID int }
+
 // ─── Focus tracking ───────────────────────────────────────────────────────────
 
 type jobSettingsFocus int
@@ -153,6 +156,7 @@ const (
 	jsFocusCustomCron
 	jsFocusPause
 	jsFocusClearDest
+	jsFocusRecover
 	jsFocusDelete
 	jsFocusSave
 	jsFocusCancel
@@ -402,6 +406,10 @@ func (m JobSettingsModel) handleActivate() (JobSettingsModel, tea.Cmd) {
 		return m, func() tea.Msg {
 			return JobSettingsClearDestMsg{JobID: m.job.ID}
 		}
+	case jsFocusRecover:
+		return m, func() tea.Msg {
+			return JobSettingsRecoverMsg{JobID: m.job.ID}
+		}
 	case jsFocusDelete:
 		return m, func() tea.Msg {
 			return JobSettingsDeleteMsg{JobID: m.job.ID}
@@ -481,6 +489,7 @@ func (m JobSettingsModel) View() string {
 	}
 	sb.WriteString("  " + m.renderButton(pauseLabel, m.focus == jsFocusPause, "warning") + "\n")
 	sb.WriteString("  " + m.renderButton("Clear Destination", m.focus == jsFocusClearDest, "danger") + "\n")
+	sb.WriteString("  " + m.renderButton("Recover from Clear", m.focus == jsFocusRecover, "warning") + "\n")
 	sb.WriteString("  " + m.renderButton("Delete Job", m.focus == jsFocusDelete, "danger") + "\n")
 	sb.WriteString("\n")
 

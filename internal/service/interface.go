@@ -62,6 +62,29 @@ type Service interface {
 	GetSettings() (*SystemSettings, error)
 	UpdateSettings(s SystemSettings) error
 
+	// ── Name Uniqueness ──────────────────────────────────────────────────
+
+	// IsNameUnique checks whether a name is unique within the project for
+	// the given entity type ("job", "source", or "destination").
+	IsNameUnique(entityType string, name string) (bool, error)
+
+	// ── Clear Destination Status ─────────────────────────────────────────
+
+	// GetClearDestStatus reports whether a clear-destination workflow is
+	// currently running for the given job.
+	GetClearDestStatus(jobID int) (bool, error)
+
+	// RecoverFromClearDest cancels stuck clear-destination workflows and
+	// restores the normal sync schedule.
+	RecoverFromClearDest(jobID int) error
+
+	// ── Full Job Update ──────────────────────────────────────────────────
+
+	// UpdateJobFull updates all job fields (name, source, dest, frequency,
+	// streams, activate, advanced settings). It blocks when clear-dest is
+	// running and cancels any in-flight sync.
+	UpdateJobFull(id int, name string, sourceID, destID int, frequency string, streams []StreamConfig, activate bool, advancedSettings *AdvancedSettings) error
+
 	// ── Schema ────────────────────────────────────────────────────────────
 
 	// ValidateSchema checks that the connected database has the expected
