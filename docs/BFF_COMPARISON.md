@@ -55,30 +55,31 @@
 
 | BFF 기능 | TUI 상태 | 차이점 |
 |----------|---------|--------|
-| CreateJob | ✅ 구현 | BFF: job 이름 유일성 검사 (`IsJobNameUniqueInProject`) → TUI: **없음** |
 | CreateJob | ✅ 구현 | BFF: source/dest를 upsert (이미 있으면 재사용) → TUI: sourceID/destID 직접 전달 |
-| UpdateJob | ⚠️ 부분 | BFF: streams, source, dest, advanced_settings 전부 업데이트 + clear-dest 진행 중 차단 → TUI: name/frequency만 (`UpdateJobMeta`) |
 | DeleteSource/Dest | ✅ 구현 | BFF: 연관 job을 cascade cancel → TUI: job 존재 시 삭제 거부 (더 보수적) |
-| ClearDestination | ✅ 구현 | BFF: `RecoverFromClearDestination` 복구 메커니즘 → TUI: **없음** |
-| ClearDestination | ✅ 구현 | BFF: `GetClearDestinationStatus` 상태 조회 → TUI: **없음** |
-| ListJobs | ✅ 구현 | BFF: lastRunState를 Temporal에서 실시간 조회 → TUI: DB에 캐시된 값만 표시 |
 
-### ❌ 미구현
+### ❌ 미구현 (non-blocking — 없어도 핵심 기능 동작)
 
-| BFF 기능 | 설명 | 중요도 |
-|----------|------|--------|
-| `GetSourceVersions` | 소스 커넥터 버전 목록 (Docker 이미지 태그) | 🟡 |
-| `GetSourceSpec` | 커넥터 스펙 JSON (폼 필드 자동 생성) | 🟡 |
-| `GetDestinationVersions` | 목적지 커넥터 버전 목록 | 🟡 |
-| `GetDestinationSpec` | 목적지 커넥터 스펙 JSON | 🟡 |
-| `GetAllReleasesResponse` | GitHub 릴리즈 목록 (업데이트 알림) | 🟢 |
-| `GetClearDestinationStatus` | clear-dest 진행 상태 조회 | 🟡 |
-| `RecoverFromClearDestination` | clear-dest 실패 시 스케줄 복원 | 🟡 |
-| `DownloadTaskLogs` | 로그 파일 다운로드 | 🟢 |
-| `UpdateJob` (full) | streams/source/dest/advancedSettings 업데이트 | 🔴 |
-| Job name uniqueness check | 동일 프로젝트 내 중복 이름 체크 | 🟡 |
-| Telemetry tracking | job/source 생성 시 텔레메트리 | 🟢 |
-| `CheckClearDestCompatibility` | 소스 버전별 clear-dest 호환성 체크 | 🟡 |
+| BFF 기능 | 설명 | 중요도 | 비고 |
+|----------|------|--------|------|
+| `GetSourceVersions` | 소스 커넥터 버전 목록 (Docker 이미지 태그) | 🟡 | BFF는 GitHub API 호출 |
+| `GetSourceSpec` | 커넥터 스펙 JSON (폼 필드 자동 생성) | 🟡 | TUI는 하드코딩 폼으로 대체 |
+| `GetDestinationVersions` | 목적지 커넥터 버전 목록 | 🟡 | 위와 동일 |
+| `GetDestinationSpec` | 목적지 커넥터 스펙 JSON | 🟡 | 위와 동일 |
+| `GetAllReleasesResponse` | GitHub 릴리즈 목록 (업데이트 알림) | 🟢 | Updates 모달 placeholder |
+| `DownloadTaskLogs` | 로그 tar.gz 다운로드 | 🟢 | TUI에서는 직접 파일 접근 가능 |
+| Telemetry tracking | job/source 생성 시 텔레메트리 | 🟢 | OLake 내부 분석용 |
+| `CheckClearDestCompatibility` | 소스 버전별 clear-dest 호환성 체크 | 🟡 | 버전 문자열 비교 |
+
+### ✅ 갭 분석 이후 추가 구현 (커밋 928994e)
+
+| BFF 기능 | TUI 구현 |
+|----------|---------|
+| `UpdateJob` (full) | `UpdateJobFull()` — 전체 필드 업데이트 + clear-dest 차단 + sync 취소 |
+| Job name uniqueness | `IsNameUnique()` + CreateJob/Source/Dest에 중복 거부 |
+| `GetClearDestinationStatus` | `GetClearDestStatus()` |
+| `RecoverFromClearDestination` | `RecoverFromClearDest()` + UI 버튼 |
+| ListJobs 실시간 상태 | `fetchJobLastRun()` — Temporal 실시간 조회 (5초 타임아웃) |
 
 ---
 
@@ -147,20 +148,20 @@
 
 ---
 
-## 우선순위 구현 로드맵
+## 구현 로드맵
 
-### Phase 1 (필수 — BFF 호환성)
-1. **`UpdateJob` 풀 구현** — streams, source, dest 전부 업데이트 가능하도록
-2. **Job name uniqueness** — `CreateJob` 시 중복 이름 체크
-3. **ListJobs lastRunState** — Temporal에서 실시간 상태 조회 (현재 DB 캐시만)
+### ✅ Phase 1 — 완료 (BFF 핵심 호환성)
+1. ~~`UpdateJob` 풀 구현~~ → `UpdateJobFull` ✅
+2. ~~Job name uniqueness~~ → `IsNameUnique` ✅
+3. ~~ListJobs 실시간 상태~~ → `fetchJobLastRun` ✅
+4. ~~Clear-dest 상태/복구~~ → `GetClearDestStatus` + `RecoverFromClearDest` ✅
 
-### Phase 2 (권장)
-4. `GetClearDestinationStatus` — clear-dest 진행 상태 표시
-5. `RecoverFromClearDestination` — 실패 시 자동 복원
-6. `GetSourceSpec` / `GetDestinationSpec` — 커넥터 스펙 기반 동적 폼
+### Phase 2 (선택 — 사용성 개선)
+5. `GetSourceSpec` / `GetDestinationSpec` — 커넥터 스펙 기반 동적 폼
+6. `GetSourceVersions` / `GetDestinationVersions` — 버전 선택기
+7. `CheckClearDestCompatibility` — 소스 버전 호환성 체크
 
-### Phase 3 (있으면 좋음)
-7. `GetSourceVersions` / `GetDestinationVersions` — 버전 선택기
+### Phase 3 (낮은 우선순위)
 8. `GetAllReleasesResponse` — 실제 릴리즈 데이터로 Updates 모달 채우기
-9. 로그 파일 다운로드
-10. Telemetry (선택적)
+9. `DownloadTaskLogs` — 로그 tar.gz 다운로드
+10. Telemetry (OLake 내부 분석용)
