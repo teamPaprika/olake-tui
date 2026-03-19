@@ -684,7 +684,7 @@ func (m *Manager) CreateDestination(d EntityBase) (*EntityBase, error) {
 		return nil, fmt.Errorf("encrypt destination config: %w", err)
 	}
 	q := fmt.Sprintf(`
-		INSERT INTO %s (name, type, version, config, project_id, created_by_id, updated_by_id, created_at, updated_at)
+		INSERT INTO %s (name, dest_type, version, config, project_id, created_by_id, updated_by_id, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $6, NOW(), NOW())`,
 		m.tbl("destination"))
 	_, err = m.db.ExecContext(context.Background(), q, d.Name, d.Type, d.Version, encCfg, m.projectID, m.currentUserID())
@@ -701,7 +701,7 @@ func (m *Manager) UpdateDestination(id int, d EntityBase) (*EntityBase, error) {
 		return nil, fmt.Errorf("encrypt destination config: %w", err)
 	}
 	q := fmt.Sprintf(`
-		UPDATE %s SET name=$1, type=$2, version=$3, config=$4, updated_by_id=$5, updated_at=NOW()
+		UPDATE %s SET name=$1, dest_type=$2, version=$3, config=$4, updated_by_id=$5, updated_at=NOW()
 		WHERE id=$6`,
 		m.tbl("destination"))
 	_, err = m.db.ExecContext(context.Background(), q, d.Name, d.Type, d.Version, encCfg, m.currentUserID(), id)
