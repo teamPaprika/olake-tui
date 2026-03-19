@@ -198,6 +198,10 @@ type Model struct {
 
 	// Version string (injected at build time)
 	version string
+
+	// ReleaseURL is an optional URL to a releases.json for update checks.
+	// Empty = air-gapped mode (no update check).
+	ReleaseURL string
 }
 
 // New creates the root application model.
@@ -1350,26 +1354,38 @@ func (m Model) showTestConnectionModal() (Model, tea.Cmd) {
 }
 
 // showUpdatesModal shows the OLake updates modal.
+// If ReleaseURL is set, fetches real release data; otherwise shows version only.
 func (m Model) showUpdatesModal() (Model, tea.Cmd) {
-	// Placeholder categories — in a real implementation these come from an API
-	categories := []ui.UpdateCategory{
-		{
-			Name:   "Features",
-			HasNew: false,
-		},
-		{
-			Name:   "OLake UI and Worker",
-			HasNew: false,
-		},
-		{
-			Name:   "OLake",
-			HasNew: false,
-		},
-		{
-			Name:   "OLake Helm",
-			HasNew: false,
-		},
+	var categories []ui.UpdateCategory
+
+	if m.ReleaseURL != "" {
+		// Fetch real data (5s timeout, non-fatal on failure)
+		cats, _ := service.FetchReleases(m.ReleaseURL)
+		for _, cat := range cats {
+			uc := ui.UpdateCategory{Name: cat.Name}
+			for _, r := range cat.Releases {
+				uc.Releases = append(uc.Releases, ui.UpdateRelease{
+					Version: r.Version,
+					Date:    r.Date,
+					Content: r.Description,
+				})
+			}
+			if len(uc.Releases) > 0 {
+				uc.HasNew = true
+			}
+			categories = append(categories, uc)
+		}
 	}
+
+	// Fallback: always show at least the current version info
+	if len(categories) == 0 {
+		categories = []ui.UpdateCategory{
+			{Name: "olake-tui", Releases: []ui.UpdateRelease{
+				{Version: m.version, Date: "installed", Content: "Current version"},
+			}},
+		}
+	}
+
 	modal := ui.NewUpdatesModal(categories)
 	return m.showModal(modal, modalCtxUpdates, 0, "")
 }

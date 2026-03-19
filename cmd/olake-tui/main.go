@@ -44,6 +44,7 @@ func main() {
 		migrateOnly   = flag.Bool("migrate-only", false, "Run migration and exit (don't start TUI)")
 		adminUser     = flag.String("admin-user", envOr("OLAKE_ADMIN_USER", "admin"), "Admin username for initial seed")
 		adminPass     = flag.String("admin-pass", envOr("OLAKE_ADMIN_PASSWORD", "admin"), "Admin password for initial seed")
+		releaseURL    = flag.String("release-url", envOr("OLAKE_RELEASE_URL", ""), "URL to releases.json for update checks (omit for air-gapped)")
 	)
 	flag.Parse()
 
@@ -96,6 +97,7 @@ func main() {
 
 	// Create root model (version injected at build time via ldflags)
 	model := app.New(svc, version)
+	model.ReleaseURL = *releaseURL
 
 	// Run Bubble Tea program in alternate screen (fullscreen TUI)
 	p := tea.NewProgram(
