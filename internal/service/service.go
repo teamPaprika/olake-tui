@@ -605,7 +605,7 @@ func (m *Manager) countJobsBySource(sourceID int) (int, error) {
 // ListDestinations returns all destinations for the project, including associated job counts.
 func (m *Manager) ListDestinations() ([]Destination, error) {
 	q := fmt.Sprintf(`
-		SELECT d.id, d.name, d.type, d.version, d.config, d.created_at, d.updated_at,
+		SELECT d.id, d.name, d.dest_type, d.version, d.config, d.created_at, d.updated_at,
 		       COALESCE(cu.username,'') AS created_by, COALESCE(uu.username,'') AS updated_by,
 		       (SELECT COUNT(*) FROM %s j WHERE j.dest_id = d.id AND j.deleted_at IS NULL) AS job_count
 		FROM %s d
@@ -644,7 +644,7 @@ func (m *Manager) ListDestinations() ([]Destination, error) {
 // GetDestination returns a single destination by ID.
 func (m *Manager) GetDestination(id int) (*Destination, error) {
 	q := fmt.Sprintf(`
-		SELECT d.id, d.name, d.type, d.version, d.config, d.created_at, d.updated_at,
+		SELECT d.id, d.name, d.dest_type, d.version, d.config, d.created_at, d.updated_at,
 		       COALESCE(cu.username,'') AS created_by, COALESCE(uu.username,'') AS updated_by
 		FROM %s d
 		LEFT JOIN %s cu ON d.created_by_id = cu.id
@@ -745,7 +745,7 @@ func (m *Manager) ListJobs() ([]Job, error) {
 		       j.created_at, j.updated_at,
 		       COALESCE(cu.username,'') AS created_by, COALESCE(uu.username,'') AS updated_by,
 		       s.id, s.name, s.type, s.version,
-		       d.id, d.name, d.type, d.version
+		       d.id, d.name, d.dest_type, d.version
 		FROM %s j
 		LEFT JOIN %s s ON j.source_id = s.id
 		LEFT JOIN %s d ON j.dest_id = d.id
@@ -809,7 +809,7 @@ func (m *Manager) GetJob(id int) (*Job, error) {
 		       j.created_at, j.updated_at,
 		       COALESCE(cu.username,'') AS created_by, COALESCE(uu.username,'') AS updated_by,
 		       s.id, s.name, s.type, s.version,
-		       d.id, d.name, d.type, d.version
+		       d.id, d.name, d.dest_type, d.version
 		FROM %s j
 		LEFT JOIN %s s ON j.source_id = s.id
 		LEFT JOIN %s d ON j.dest_id = d.id
