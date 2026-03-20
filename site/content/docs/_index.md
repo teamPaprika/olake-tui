@@ -3,26 +3,30 @@ title: "olake-tui Documentation"
 weight: 1
 ---
 
-# olake-tui
+# olake-tui Documentation
 
-Terminal UI for [OLake](https://olake.io) — manage data pipelines without leaving the command line.
+**olake-tui** is a terminal UI for [OLake](https://olake.io) — manage data pipelines without leaving the command line. It connects directly to PostgreSQL and Temporal, replacing the BFF web server entirely.
 
-## Getting Started
+## Sections
 
-Get up and running in 5 minutes.
-[→ Quick Start]({{< relref "getting-started/quick-start" >}})
+### [Getting Started](getting-started/)
+Install olake-tui and run your first pipeline in 5 minutes.
 
-## User Guide
+### [User Guide](user-guide/)
+In-depth guide for every feature: sources, destinations, jobs, monitoring, and more.
 
-Learn every feature in depth.
-[→ User Guide]({{< relref "user-guide" >}})
+### [Deployment](deployment/)
+Deploy with Docker Compose, Kubernetes Helm, or in air-gapped environments.
 
-## Deployment
+### [Architecture](architecture/)
+How olake-tui works: direct DB access, Temporal SDK, BFF compatibility.
 
-Docker Compose, Helm, air-gapped environments.
-[→ Deployment]({{< relref "deployment" >}})
+### [Development](development/)
+Contribute, run tests, or add new connectors.
 
-## Architecture
+### [Reference](reference/)
+CLI flags, environment variables, and changelog.
 
-How olake-tui works under the hood.
-[→ Architecture]({{< relref "architecture" >}})
+---
+
+**Quick links:** [Quick Start](getting-started/quick-start/) · [Key Bindings](user-guide/key-bindings/) · [CLI Reference](reference/cli-reference/) · [GitHub](https://github.com/teamPaprika/olake-tui)
