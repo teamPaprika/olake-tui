@@ -29,6 +29,8 @@ const (
 	ScreenJobWizard
 	ScreenSourceForm
 	ScreenDestForm
+	ScreenSourceDetail
+	ScreenDestDetail
 )
 
 // Tab identifiers (for main navigation).
@@ -177,6 +179,10 @@ type Model struct {
 	// Entity (source/dest) create/edit form
 	entityForm *ui.EntityFormModel
 
+	// Source/Destination detail views
+	sourceDetail *ui.SourceDetailModel
+	destDetail   *ui.DestDetailModel
+
 	// Modal overlay system (all 17 modals)
 	modalState   ui.ModalState
 	modalCtx     modalContext
@@ -279,6 +285,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.entityForm != nil {
 			m.entityForm.SetSize(m.width, m.height)
+		}
+		if m.sourceDetail != nil {
+			m.sourceDetail.SetSize(m.width, m.height)
+		}
+		if m.destDetail != nil {
+			m.destDetail.SetSize(m.width, m.height)
 		}
 
 	// ---------- Toast show ----------
@@ -510,6 +522,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Batch(cmds...)
 		}
+
+	case ui.SourceDetailBackMsg:
+		m.screen = ScreenSources
+		m.sourceDetail = nil
+		return m, nil
+
+	case ui.DestDetailBackMsg:
+		m.screen = ScreenDestinations
+		m.destDetail = nil
+		return m, nil
 
 	case ui.JobDetailBackMsg:
 		m.screen = ScreenJobs
@@ -788,6 +810,14 @@ func (m Model) handleKey(msg tea.KeyMsg, cmds []tea.Cmd) (tea.Model, tea.Cmd) {
 		case ScreenConfirm:
 			m.screen = m.screenBeforeConfirm()
 			return m, nil
+		case ScreenSourceDetail:
+			m.screen = ScreenSources
+			m.sourceDetail = nil
+			return m, nil
+		case ScreenDestDetail:
+			m.screen = ScreenDestinations
+			m.destDetail = nil
+			return m, nil
 		case ScreenSourceForm:
 			return m.closeEntityForm(), nil
 		case ScreenDestForm:
@@ -848,6 +878,18 @@ func (m Model) handleKey(msg tea.KeyMsg, cmds []tea.Cmd) (tea.Model, tea.Cmd) {
 	if m.screen == ScreenJobDetail && m.jobDetail != nil {
 		detail, cmd := m.jobDetail.Update(msg)
 		m.jobDetail = &detail
+		return m, cmd
+	}
+
+	// Source/Dest detail screens
+	if m.screen == ScreenSourceDetail && m.sourceDetail != nil {
+		detail, cmd := m.sourceDetail.Update(msg)
+		m.sourceDetail = &detail
+		return m, cmd
+	}
+	if m.screen == ScreenDestDetail && m.destDetail != nil {
+		detail, cmd := m.destDetail.Update(msg)
+		m.destDetail = &detail
 		return m, cmd
 	}
 
@@ -970,6 +1012,10 @@ func (m Model) handleTabKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				return m, tea.Batch(showToast("Testing connection…", false), testCmd)
 			}
+		case "enter":
+			if s := m.sources.SelectedSource(); s != nil {
+				return m.openSourceDetail(*s)
+			}
 		case "d":
 			if s := m.sources.SelectedSource(); s != nil {
 				// Use the new DeleteModal with job names (jobs list may be empty if not loaded)
@@ -1007,6 +1053,10 @@ func (m Model) handleTabKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return msgTestDestinationDone{err: err}
 				}
 				return m, tea.Batch(showToast("Testing connection…", false), testCmd)
+			}
+		case "enter":
+			if d := m.destinations.SelectedDestination(); d != nil {
+				return m.openDestDetail(*d)
 			}
 		case "d":
 			if d := m.destinations.SelectedDestination(); d != nil {
@@ -1581,6 +1631,24 @@ func (m Model) openSystemSettings() (Model, tea.Cmd) {
 	return m, cmd
 }
 
+// openSourceDetail opens the source detail view.
+func (m Model) openSourceDetail(s service.Source) (Model, tea.Cmd) {
+	detail := ui.NewSourceDetailModel(s, m.jobList)
+	detail.SetSize(m.width, m.height)
+	m.sourceDetail = &detail
+	m.screen = ScreenSourceDetail
+	return m, nil
+}
+
+// openDestDetail opens the destination detail view.
+func (m Model) openDestDetail(d service.Destination) (Model, tea.Cmd) {
+	detail := ui.NewDestDetailModel(d, m.jobList)
+	detail.SetSize(m.width, m.height)
+	m.destDetail = &detail
+	m.screen = ScreenDestDetail
+	return m, nil
+}
+
 // openSourceCreate opens the source creation form.
 func (m Model) openSourceCreate() (Model, tea.Cmd) {
 	ef := ui.NewEntityFormModel(ui.EntityKindSource, m.width, m.height)
@@ -1783,6 +1851,17 @@ func (m Model) View() string {
 		return lipgloss.JoinVertical(lipgloss.Left, header, m.sysSettings.View(), status)
 	}
 
+	if m.screen == ScreenSourceDetail && m.sourceDetail != nil {
+		header := m.renderHeader()
+		status := m.renderStatusBar()
+		return lipgloss.JoinVertical(lipgloss.Left, header, m.sourceDetail.View(), status)
+	}
+	if m.screen == ScreenDestDetail && m.destDetail != nil {
+		header := m.renderHeader()
+		status := m.renderStatusBar()
+		return lipgloss.JoinVertical(lipgloss.Left, header, m.destDetail.View(), status)
+	}
+
 	if m.screen == ScreenJobWizard && m.wizard != nil {
 		return m.wizard.View()
 	}
@@ -1899,6 +1978,8 @@ func (m Model) renderStatusBar() string {
 		hint = "1-4:tabs  a:add  e:edit  d:delete  t:test  r:refresh  q:quit"
 	case ScreenSourceForm, ScreenDestForm:
 		hint = "tab/↑↓:move  ←→:change type  enter:next/submit  esc:back"
+	case ScreenSourceDetail, ScreenDestDetail:
+		hint = "esc: back"
 	case ScreenJobLogs:
 		hint = "↑↓/pgup/pgdn:scroll  p:older  n:newer  esc:back  q:quit"
 	default:
