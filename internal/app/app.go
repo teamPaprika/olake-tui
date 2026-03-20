@@ -363,6 +363,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.jobs.SetLoading(true)
 			cmds = append(cmds, m.loadJobs(), showToast("Job updated", false))
+			// If job settings is open, update the job object so the UI reflects
+			// the new activate state (e.g. Pause→Resume button label).
+			if m.jobSettings != nil {
+				j := m.jobSettings.Job()
+				j.Activate = !j.Activate
+				updated := ui.NewJobSettingsModel(j)
+				updated.SetSize(m.width, m.height)
+				m.jobSettings = &updated
+			}
 		}
 
 	// ---------- Task history ----------
@@ -1574,13 +1583,18 @@ func (m Model) switchTab(t Tab) (Model, tea.Cmd) {
 	return m, cmd
 }
 
-// openLogs loads task list and then opens the log viewer.
+// openLogs opens the job detail screen first so the user can pick a task.
+// Direct log viewing from the jobs list requires a task selection — we can't
+// open logs without a file path, so we show task history instead.
 func (m Model) openLogs(jobID int) (Model, tea.Cmd) {
-	logModel := ui.NewJobLogsModel(jobID, "latest", "", m.width, m.height)
-	logModel.SetLoading(true)
-	m.logs = &logModel
-	m.screen = ScreenJobLogs
-	return m, m.loadLogs(jobID, "", -1, "older")
+	// Find the job to show detail
+	for _, j := range m.jobList {
+		if j.ID == jobID {
+			return m.openJobDetail(j)
+		}
+	}
+	// Fallback: just go to job detail with minimal info
+	return m.openJobDetail(service.Job{ID: jobID, Name: fmt.Sprintf("Job %d", jobID)})
 }
 
 // openLogsForTask opens the log viewer for a specific task by file path.
@@ -1659,7 +1673,7 @@ func (m Model) openSourceCreate() (Model, tea.Cmd) {
 
 // openSourceEdit opens the source edit form pre-filled with existing data.
 func (m Model) openSourceEdit(s *service.Source) (Model, tea.Cmd) {
-	ef := ui.NewEntityFormModelEdit(ui.EntityKindSource, s.ID, s.Name, s.Type, s.Config, m.width, m.height)
+	ef := ui.NewEntityFormModelEdit(ui.EntityKindSource, s.ID, s.Name, s.Type, s.Version, s.Config, m.width, m.height)
 	m.entityForm = &ef
 	m.screen = ScreenSourceForm
 	return m, ef.Init()
@@ -1675,7 +1689,7 @@ func (m Model) openDestCreate() (Model, tea.Cmd) {
 
 // openDestEdit opens the destination edit form pre-filled with existing data.
 func (m Model) openDestEdit(d *service.Destination) (Model, tea.Cmd) {
-	ef := ui.NewEntityFormModelEdit(ui.EntityKindDest, d.ID, d.Name, d.Type, d.Config, m.width, m.height)
+	ef := ui.NewEntityFormModelEdit(ui.EntityKindDest, d.ID, d.Name, d.Type, d.Version, d.Config, m.width, m.height)
 	m.entityForm = &ef
 	m.screen = ScreenDestForm
 	return m, ef.Init()

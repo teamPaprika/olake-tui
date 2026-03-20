@@ -55,7 +55,8 @@ type EntityFormModel struct {
 	width  int
 	height int
 
-	step entityFormStep
+	step    entityFormStep
+	version string // stored version for edit mode
 
 	// Step 1: meta fields
 	nameInput      textinput.Model
@@ -90,7 +91,7 @@ func NewEntityFormModel(kind EntityKind, w, h int) EntityFormModel {
 }
 
 // NewEntityFormModelEdit creates a pre-filled form for editing an existing entity.
-func NewEntityFormModelEdit(kind EntityKind, id int, name, connType, configJSON string, w, h int) EntityFormModel {
+func NewEntityFormModelEdit(kind EntityKind, id int, name, connType, version, configJSON string, w, h int) EntityFormModel {
 	ti := textinput.New()
 	ti.Placeholder = "My Source"
 	ti.CharLimit = 100
@@ -118,6 +119,7 @@ func NewEntityFormModelEdit(kind EntityKind, id int, name, connType, configJSON 
 		kind:           kind,
 		mode:           EntityFormEdit,
 		id:             id,
+		version:        version,
 		width:          w,
 		height:         h,
 		step:           entityFormStepMeta,
@@ -294,13 +296,17 @@ func (m EntityFormModel) handleConnFormSubmit(msg FormSubmitMsg) (EntityFormMode
 	name := strings.TrimSpace(m.nameInput.Value())
 	configJSON := BuildConfigJSON(msg.Values)
 
+	ver := m.version
+	if ver == "" {
+		ver = "latest"
+	}
 	submitMsg := EntityFormSubmitMsg{
 		Kind:       m.kind,
 		Mode:       m.mode,
 		ID:         m.id,
 		Name:       name,
 		Type:       connType,
-		Version:    "latest",
+		Version:    ver,
 		ConfigJSON: configJSON,
 	}
 	return m, func() tea.Msg { return submitMsg }
