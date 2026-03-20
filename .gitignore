@@ -6,3 +6,4 @@ _olake-ui-ref/
 src-rust-archive/
 olake-tui
 bin/
+site/public/
