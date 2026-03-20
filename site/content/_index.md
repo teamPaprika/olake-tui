@@ -16,8 +16,8 @@ layout: "hextra-home"
 </div>
 
 <div class="hx-mb-6">
-{{< hextra/hero-badge link="https://github.com/teamPaprika/olake-tui" >}}
-  <span>GitHub</span>
+{{< hextra/hero-badge link="docs/" >}}
+  <span>Documentation →</span>
   {{< icon name="arrow-circle-right" attributes="height=14" >}}
 {{< /hextra/hero-badge >}}
 </div>
