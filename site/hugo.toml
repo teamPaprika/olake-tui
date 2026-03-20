@@ -17,6 +17,9 @@ theme = "hextra"
   [params.page]
     width = "wide"
 
+[outputs]
+  home = ["HTML", "RSS", "JSON"]
+
 [markup.goldmark.renderer]
   unsafe = true
 
