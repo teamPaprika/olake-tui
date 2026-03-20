@@ -1,167 +1,167 @@
-# OLake TUI vs BFF — 기능 비교 및 테스트 체크리스트
+# OLake TUI vs BFF — Feature Comparison & Test Checklist
 
-> 생성일: 2026-03-19
-> olake-tui 커밋: f7e006b / BFF 참조: `_olake-ui-ref/server/`
+> Created: 2026-03-19
+> BFF reference: `datazip-inc/olake-ui/server/`
 
-## 아키텍처 차이
+## Architecture Differences
 
-| 항목 | BFF (olake-ui server) | olake-tui |
+| Area | BFF (olake-ui server) | olake-tui |
 |------|----------------------|-----------|
-| DB 접근 | Beego ORM | database/sql (lib/pq) |
-| Temporal | temporal wrapper 패키지 | go.temporal.io/sdk 직접 사용 |
-| 암호화 | AES-256-GCM (utils/encryption.go) | ✅ 동일 구현 |
-| 인증 | bcrypt + session cookie | ✅ bcrypt (DB 직접 조회) |
-| 테이블 네이밍 | `olake-{runMode}-{entity}` | ✅ 동일 |
-| Soft Delete | Beego ORM (deleted_at) | ✅ 수동 구현 |
+| DB access | Beego ORM | database/sql (lib/pq) |
+| Temporal | temporal wrapper package | go.temporal.io/sdk direct |
+| Encryption | AES-256-GCM (utils/encryption.go) | ✅ Same implementation |
+| Auth | bcrypt + session cookie | ✅ bcrypt (direct DB query) |
+| Table naming | `olake-{runMode}-{entity}` | ✅ Same |
+| Soft delete | Beego ORM (deleted_at) | ✅ Manual implementation |
 
 ---
 
-## 기능별 비교
+## Feature Comparison
 
-### ✅ 완전 구현
+### ✅ Fully Implemented
 
-| BFF 기능 | TUI 메서드 | 비고 |
-|----------|-----------|------|
-| Login | `Login()` | bcrypt 검증 동일 |
-| ListSources | `ListSources()` | job_count 포함 |
-| GetSource | `GetSource()` | - |
-| CreateSource | `CreateSource()` | 암호화 포함 |
-| UpdateSource | `UpdateSource()` | - |
-| DeleteSource | `DeleteSource()` | soft-delete + job count 체크 |
-| ListDestinations | `ListDestinations()` | job_count 포함 |
-| GetDestination | `GetDestination()` | - |
-| CreateDestination | `CreateDestination()` | - |
-| UpdateDestination | `UpdateDestination()` | - |
-| DeleteDestination | `DeleteDestination()` | soft-delete + job count 체크 |
-| ListJobs | `ListJobs()` | source/dest JOIN 포함 |
-| GetJob | `GetJob()` | - |
-| CreateJob | `CreateJob()` | ✅ Temporal 스케줄 생성 포함 |
-| DeleteJob | `DeleteJob()` | Temporal 스케줄 삭제 포함 |
+| BFF Feature | TUI Method | Notes |
+|-------------|-----------|-------|
+| Login | `Login()` | Same bcrypt verification |
+| ListSources | `ListSources()` | Includes job_count |
+| GetSource | `GetSource()` | — |
+| CreateSource | `CreateSource()` | With encryption |
+| UpdateSource | `UpdateSource()` | — |
+| DeleteSource | `DeleteSource()` | Soft-delete + job count check |
+| ListDestinations | `ListDestinations()` | Includes job_count |
+| GetDestination | `GetDestination()` | — |
+| CreateDestination | `CreateDestination()` | — |
+| UpdateDestination | `UpdateDestination()` | — |
+| DeleteDestination | `DeleteDestination()` | Soft-delete + job count check |
+| ListJobs | `ListJobs()` | Includes source/dest JOIN |
+| GetJob | `GetJob()` | — |
+| CreateJob | `CreateJob()` | ✅ Includes Temporal schedule creation |
+| DeleteJob | `DeleteJob()` | Includes Temporal schedule deletion |
 | TriggerSync | `TriggerSync()` | schedule.Trigger() |
-| CancelJob | `CancelJob()` | workflow cancel |
+| CancelJob | `CancelJob()` | Workflow cancel |
 | ActivateJob | `ActivateJob()` | DB + schedule pause/unpause |
-| UpdateJobMeta | `UpdateJobMeta()` | name + frequency |
+| UpdateJobMeta | `UpdateJobMeta()` | Name + frequency |
 | GetJobTasks | `ListJobTasks()` | Temporal workflow history |
-| GetTaskLogs | `GetTaskLogs()` | 디스크 로그 파일 읽기 |
+| GetTaskLogs | `GetTaskLogs()` | Disk log file reader |
 | TestSourceConnection | `TestSource()` | Temporal check workflow |
 | TestDestConnection | `TestDestination()` | Temporal check workflow |
 | DiscoverStreams | `DiscoverStreams()` | Temporal discover workflow |
-| ClearDestination | `ClearDestination()` | 2단계 confirm + schedule 교체 |
-| GetSettings | `GetSettings()` | project-settings 테이블 |
+| ClearDestination | `ClearDestination()` | 2-step confirm + schedule swap |
+| GetSettings | `GetSettings()` | project-settings table |
 | UpdateSettings | `UpdateSettings()` | UPSERT |
-| ValidateSchema | `ValidateSchema()` | 테이블 존재 여부 체크 |
+| ValidateSchema | `ValidateSchema()` | Table existence check |
 
-### ⚠️ 부분 구현 (차이 있음)
+### ⚠️ Partial Implementation (behavioral differences)
 
-| BFF 기능 | TUI 상태 | 차이점 |
-|----------|---------|--------|
-| CreateJob | ✅ 구현 | BFF: source/dest를 upsert (이미 있으면 재사용) → TUI: sourceID/destID 직접 전달 |
-| DeleteSource/Dest | ✅ 구현 | BFF: 연관 job을 cascade cancel → TUI: job 존재 시 삭제 거부 (더 보수적) |
+| BFF Feature | TUI Status | Difference |
+|-------------|-----------|------------|
+| CreateJob | ✅ Implemented | BFF: upserts source/dest (reuses existing) → TUI: passes sourceID/destID directly |
+| DeleteSource/Dest | ✅ Implemented | BFF: cascade cancels related jobs → TUI: rejects deletion if jobs exist (more conservative) |
 
-### ❌ 미구현 (non-blocking — 없어도 핵심 기능 동작)
+### ❌ Not Implemented (non-blocking — core features work without these)
 
-| BFF 기능 | 설명 | 중요도 | 비고 |
-|----------|------|--------|------|
-| `GetSourceVersions` | 소스 커넥터 버전 목록 (Docker 이미지 태그) | 🟡 | BFF는 GitHub API 호출 |
-| `GetSourceSpec` | 커넥터 스펙 JSON (폼 필드 자동 생성) | 🟡 | TUI는 하드코딩 폼으로 대체 |
-| `GetDestinationVersions` | 목적지 커넥터 버전 목록 | 🟡 | 위와 동일 |
-| `GetDestinationSpec` | 목적지 커넥터 스펙 JSON | 🟡 | 위와 동일 |
-| `GetAllReleasesResponse` | GitHub 릴리즈 목록 (업데이트 알림) | 🟢 | Updates 모달 placeholder |
-| `DownloadTaskLogs` | 로그 tar.gz 다운로드 | 🟢 | TUI에서는 직접 파일 접근 가능 |
-| Telemetry tracking | job/source 생성 시 텔레메트리 | 🟢 | OLake 내부 분석용 |
-| `CheckClearDestCompatibility` | 소스 버전별 clear-dest 호환성 체크 | 🟡 | 버전 문자열 비교 |
+| BFF Feature | Description | Priority | Notes |
+|-------------|-------------|----------|-------|
+| `GetSourceVersions` | Source connector version list (Docker image tags) | 🟡 | BFF calls GitHub API |
+| `GetSourceSpec` | Connector spec JSON (auto-generated form fields) | 🟡 | TUI uses hardcoded forms instead |
+| `GetDestinationVersions` | Destination connector version list | 🟡 | Same as above |
+| `GetDestinationSpec` | Destination connector spec JSON | 🟡 | Same as above |
+| `GetAllReleasesResponse` | GitHub releases list (update notifications) | 🟢 | Updates modal placeholder |
+| `DownloadTaskLogs` | Log tar.gz download | 🟢 | TUI has direct filesystem access |
+| Telemetry tracking | Job/source creation telemetry | 🟢 | OLake internal analytics |
+| `CheckClearDestCompatibility` | Source version clear-dest compatibility check | 🟡 | Version string comparison |
 
-### ✅ 갭 분석 이후 추가 구현 (커밋 928994e)
+### ✅ Added After Gap Analysis
 
-| BFF 기능 | TUI 구현 |
-|----------|---------|
-| `UpdateJob` (full) | `UpdateJobFull()` — 전체 필드 업데이트 + clear-dest 차단 + sync 취소 |
-| Job name uniqueness | `IsNameUnique()` + CreateJob/Source/Dest에 중복 거부 |
+| BFF Feature | TUI Implementation |
+|-------------|-------------------|
+| `UpdateJob` (full) | `UpdateJobFull()` — all fields + clear-dest blocking + sync cancellation |
+| Job name uniqueness | `IsNameUnique()` + duplicate rejection in CreateJob/Source/Dest |
 | `GetClearDestinationStatus` | `GetClearDestStatus()` |
-| `RecoverFromClearDestination` | `RecoverFromClearDest()` + UI 버튼 |
-| ListJobs 실시간 상태 | `fetchJobLastRun()` — Temporal 실시간 조회 (5초 타임아웃) |
+| `RecoverFromClearDestination` | `RecoverFromClearDest()` + UI button |
+| ListJobs real-time status | `fetchJobLastRun()` — live Temporal query (5s timeout) |
 
 ---
 
-## E2E 테스트 체크리스트
+## E2E Test Checklist
 
-실제 OLake 환경에서 검증해야 할 항목들:
+Items to verify against a real OLake environment:
 
-### 인증
-- [ ] 유효한 credentials로 로그인 성공
-- [ ] 잘못된 credentials로 로그인 실패 + 에러 메시지 확인
-- [ ] 빈 username/password 클라이언트 검증 동작
+### Authentication
+- [ ] Successful login with valid credentials
+- [ ] Failed login with invalid credentials + error message
+- [ ] Client-side empty username/password validation
 
 ### Sources
-- [ ] 소스 목록 조회 (job count 정확성)
-- [ ] PostgreSQL 소스 생성
-- [ ] 소스 이름/config 수정
-- [ ] 소스 삭제 (연관 job 없는 경우)
-- [ ] 소스 삭제 거부 (연관 job 있는 경우)
-- [ ] 소스 연결 테스트 (Temporal check workflow)
-- [ ] 암호화된 config가 BFF에서도 복호화 가능한지 확인
+- [ ] List sources (job count accuracy)
+- [ ] Create PostgreSQL source
+- [ ] Edit source name/config
+- [ ] Delete source (no associated jobs)
+- [ ] Delete source rejected (has associated jobs)
+- [ ] Connection test (Temporal check workflow)
+- [ ] Encrypted config decryptable by BFF
 
 ### Destinations
-- [ ] 목적지 목록 조회
-- [ ] Iceberg/Parquet 목적지 생성
-- [ ] 목적지 수정
-- [ ] 목적지 삭제
-- [ ] 목적지 연결 테스트
+- [ ] List destinations
+- [ ] Create Iceberg/Parquet destination
+- [ ] Edit destination
+- [ ] Delete destination
+- [ ] Connection test
 
 ### Jobs
-- [ ] Job 목록 조회 (source/dest name 매핑)
-- [ ] Job 생성 → Temporal 스케줄 생성 확인 (`tctl schedule list`)
-- [ ] Job 스케줄 트리거 (수동 sync)
-- [ ] Job 취소 (running workflow cancel)
-- [ ] Job 일시정지/재개 (schedule pause/unpause)
-- [ ] Job 삭제 → Temporal 스케줄 삭제 확인
-- [ ] Job 이름/frequency 수정
-- [ ] Job 태스크 히스토리 조회
-- [ ] 태스크 로그 조회 (pagination: older/newer)
+- [ ] List jobs (source/dest name mapping)
+- [ ] Create job → verify Temporal schedule (`tctl schedule list`)
+- [ ] Trigger sync (manual)
+- [ ] Cancel running sync (workflow cancel)
+- [ ] Pause/resume job (schedule pause/unpause)
+- [ ] Delete job → verify Temporal schedule removed
+- [ ] Edit job name/frequency
+- [ ] Task history listing
+- [ ] Task log viewer (pagination: older/newer)
 
 ### Streams
-- [ ] Source에서 스트림 discover
-- [ ] 스트림 선택/해제
-- [ ] per-stream sync mode 설정
-- [ ] cursor field 설정
+- [ ] Discover streams from source
+- [ ] Select/deselect streams
+- [ ] Per-stream sync mode configuration
+- [ ] Cursor field configuration
 
 ### Settings
-- [ ] Webhook URL 조회
-- [ ] Webhook URL 저장
+- [ ] Retrieve webhook URL
+- [ ] Save webhook URL
 
 ### Clear Destination
-- [ ] Clear destination 실행 (2단계 confirm)
-- [ ] 실행 후 Temporal 스케줄이 sync로 복원되는지 확인
+- [ ] Execute clear destination (2-step confirmation)
+- [ ] Verify Temporal schedule restored to sync after completion
 
-### 교차 호환성
-- [ ] TUI에서 생성한 source를 BFF UI에서 조회/수정 가능
-- [ ] BFF에서 생성한 job을 TUI에서 조회/sync/cancel 가능
-- [ ] 암호화 키 동일할 때 양방향 config 복호화
-- [ ] TUI에서 soft-delete한 항목이 BFF에서도 보이지 않음
+### Cross-Compatibility
+- [ ] Source created by TUI visible/editable in BFF web UI
+- [ ] Job created by BFF manageable in TUI (list/sync/cancel)
+- [ ] Bidirectional config decryption with same encryption key
+- [ ] Soft-deleted items hidden in both TUI and BFF
 
-### 엣지 케이스
-- [ ] Temporal 미연결 상태에서 TUI 실행 → DB 기능만 동작
-- [ ] 잘못된 DB URL → 명확한 에러 메시지
-- [ ] 잘못된 runMode → 거부됨
-- [ ] 좁은 터미널 (80x24)에서 레이아웃 깨짐 없음
-- [ ] 매우 긴 source/job 이름 → 잘림 처리
+### Edge Cases
+- [ ] TUI runs without Temporal connection → DB features work
+- [ ] Invalid DB URL → clear error message
+- [ ] Invalid runMode → rejected
+- [ ] Narrow terminal (80x24) → no layout breakage
+- [ ] Very long source/job names → truncated properly
 
 ---
 
-## 구현 로드맵
+## Implementation Roadmap
 
-### ✅ Phase 1 — 완료 (BFF 핵심 호환성)
-1. ~~`UpdateJob` 풀 구현~~ → `UpdateJobFull` ✅
+### ✅ Phase 1 — Complete (core BFF compatibility)
+1. ~~`UpdateJob` full implementation~~ → `UpdateJobFull` ✅
 2. ~~Job name uniqueness~~ → `IsNameUnique` ✅
-3. ~~ListJobs 실시간 상태~~ → `fetchJobLastRun` ✅
-4. ~~Clear-dest 상태/복구~~ → `GetClearDestStatus` + `RecoverFromClearDest` ✅
+3. ~~ListJobs real-time status~~ → `fetchJobLastRun` ✅
+4. ~~Clear-dest status/recovery~~ → `GetClearDestStatus` + `RecoverFromClearDest` ✅
 
-### Phase 2 (선택 — 사용성 개선)
-5. `GetSourceSpec` / `GetDestinationSpec` — 커넥터 스펙 기반 동적 폼
-6. `GetSourceVersions` / `GetDestinationVersions` — 버전 선택기
-7. `CheckClearDestCompatibility` — 소스 버전 호환성 체크
+### Phase 2 (optional — UX improvements)
+5. `GetSourceSpec` / `GetDestinationSpec` — spec-based dynamic forms
+6. `GetSourceVersions` / `GetDestinationVersions` — version selector
+7. `CheckClearDestCompatibility` — source version compatibility check
 
-### Phase 3 (낮은 우선순위)
-8. `GetAllReleasesResponse` — 실제 릴리즈 데이터로 Updates 모달 채우기
-9. `DownloadTaskLogs` — 로그 tar.gz 다운로드
-10. Telemetry (OLake 내부 분석용)
+### Phase 3 (low priority)
+8. `GetAllReleasesResponse` — real release data in Updates modal
+9. `DownloadTaskLogs` — log tar.gz download
+10. Telemetry (OLake internal analytics)
