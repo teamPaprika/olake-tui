@@ -1,0 +1,153 @@
+# OLake TUI — Standalone Infrastructure
+#
+# This compose file runs only the infrastructure needed for olake-tui:
+#   PostgreSQL, Temporal, Elasticsearch, and the OLake Worker.
+#
+# The BFF server (olake-ui) and signup-init container are NOT needed —
+# olake-tui connects directly to PostgreSQL + Temporal and can bootstrap
+# the database schema itself via --migrate.
+#
+# Usage:
+#   docker compose up -d
+#   olake-tui --db-url "postgres://temporal:temporal@localhost:5432/temporal?sslmode=disable" \
+#             --temporal-host localhost:7233 \
+#             --migrate --admin-user admin --admin-pass changeme
+#
+# To also run the Temporal web UI (for debugging):
+#   docker compose --profile debug up -d
+
+x-app-defaults:
+  host_persistence_path: &hostPersistencePath ${PWD}/olake-data
+  worker_config_volume_details: &workerConfigVolumeDetails
+    type: bind
+    source: *hostPersistencePath
+    target: /tmp/olake-config
+
+x-encryption:
+  key: &encryptionKey ""
+
+x-envs:
+  shared: &sharedEnvs
+    CONTAINER_REGISTRY_BASE: ${CONTAINER_REGISTRY_BASE:-registry-1.docker.io}
+    OLAKE_SECRET_KEY: *encryptionKey
+    PERSISTENT_DIR: *hostPersistencePath
+
+services:
+  # ── PostgreSQL ─────────────────────────────────────────────────────────
+  # Shared by Temporal (internal state) and OLake (sources, jobs, etc.).
+  # OLake tables are created by `olake-tui --migrate` on first run.
+  postgresql:
+    container_name: temporal-postgresql
+    image: ${CONTAINER_REGISTRY_BASE:-registry-1.docker.io}/library/postgres:13
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+    networks:
+      - olake-network
+    ports:
+      - "5432:5432"
+    volumes:
+      - temporal-postgresql-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal -h localhost -p 5432"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Elasticsearch (required by Temporal for visibility) ────────────────
+  elasticsearch:
+    container_name: temporal-elasticsearch
+    image: ${CONTAINER_REGISTRY_BASE:-registry-1.docker.io}/library/elasticsearch:7.17.10
+    environment:
+      - cluster.routing.allocation.disk.threshold_enabled=true
+      - cluster.routing.allocation.disk.watermark.low=512mb
+      - cluster.routing.allocation.disk.watermark.high=256mb
+      - cluster.routing.allocation.disk.watermark.flood_stage=128mb
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms256m -Xmx256m
+      - xpack.security.enabled=false
+    networks:
+      - olake-network
+    volumes:
+      - temporal-elasticsearch-data:/usr/share/elasticsearch/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # ── Temporal ───────────────────────────────────────────────────────────
+  temporal:
+    container_name: temporal
+    image: ${CONTAINER_REGISTRY_BASE:-registry-1.docker.io}/temporalio/auto-setup:1.22.3
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=postgresql
+      - ENABLE_ES=true
+      - ES_SEEDS=elasticsearch
+      - ES_VERSION=v7
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CLI_ADDRESS=temporal:7233
+    networks:
+      - olake-network
+    ports:
+      - "7233:7233"
+    restart: unless-stopped
+
+  # ── OLake Temporal Worker ──────────────────────────────────────────────
+  # Executes sync, discover, check, and clear-destination workflows.
+  temporal-worker:
+    container_name: olake-temporal-worker
+    image: ${CONTAINER_REGISTRY_BASE:-registry-1.docker.io}/olakego/ui-worker:latest
+    pull_policy: always
+    networks:
+      - olake-network
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - <<: *workerConfigVolumeDetails
+    environment:
+      <<: *sharedEnvs
+      # No callback URL needed — olake-tui reads status directly from Temporal
+      OLAKE_CALLBACK_URL: ""
+    depends_on:
+      temporal:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── Temporal Web UI (optional, for debugging) ──────────────────────────
+  temporal-ui:
+    container_name: temporal-ui
+    image: ${CONTAINER_REGISTRY_BASE:-registry-1.docker.io}/temporalio/ui:2.16.2
+    profiles:
+      - debug
+    depends_on:
+      temporal:
+        condition: service_started
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    networks:
+      - olake-network
+    ports:
+      - "8081:8080"
+    restart: unless-stopped
+
+networks:
+  olake-network:
+    driver: bridge
+    name: olake-network
+
+volumes:
+  temporal-postgresql-data:
+    driver: local
+  temporal-elasticsearch-data:
+    driver: local

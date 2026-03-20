@@ -281,28 +281,30 @@ OLAKE_RUN_MODE=dev
 
 Load: `set -a && source .env && set +a && olake-tui`
 
-### Docker Compose (standalone)
+### Docker Compose (standalone — no BFF needed)
 
-```yaml
-services:
-  postgres:
-    image: postgres:16
-    environment:
-      POSTGRES_DB: olake
-      POSTGRES_USER: olake
-      POSTGRES_PASSWORD: olake
-    ports: ["5432:5432"]
-
-  temporal:
-    image: temporalio/auto-setup:latest
-    ports: ["7233:7233"]
-    depends_on: [postgres]
-```
-
-Then:
 ```bash
-olake-tui --db-url "postgres://olake:olake@localhost:5432/olake" --migrate
+# 1. Start infrastructure (PostgreSQL + Temporal + Worker)
+docker compose up -d
+
+# 2. Connect with olake-tui (creates tables + admin user on first run)
+olake-tui \
+  --db-url "postgres://temporal:temporal@localhost:5432/temporal?sslmode=disable" \
+  --temporal-host localhost:7233 \
+  --migrate --admin-user admin --admin-pass changeme
+
+# Optional: also start Temporal web UI for debugging
+docker compose --profile debug up -d
+# → http://localhost:8081
 ```
+
+The included `docker-compose.yml` runs only the infrastructure OLake needs:
+- **PostgreSQL** — shared by Temporal and OLake (tables created by `--migrate`)
+- **Temporal** — workflow orchestration
+- **Elasticsearch** — Temporal visibility
+- **OLake Worker** — executes sync/discover/check workflows
+
+No BFF server, no signup container, no web frontend.
 
 ---
 
