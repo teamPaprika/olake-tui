@@ -1,0 +1,120 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "olake-tui.fullname" . }}-migrate
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olake-tui.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+    {{- with .Values.migrate.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "olake-tui.labels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: OnFailure
+      {{- with .Values.migrate.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.migrate.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.migrate.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+      - name: wait-for-postgres
+        image: busybox:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          echo "Waiting for PostgreSQL..."
+          {{- if .Values.database.existingSecret }}
+          until nc -z ${DB_HOST} ${DB_PORT}; do sleep 2; done
+          {{- else }}
+          until nc -z {{ .Values.database.host }} {{ .Values.database.port }}; do sleep 2; done
+          {{- end }}
+          echo "PostgreSQL ready."
+        {{- if .Values.database.existingSecret }}
+        env:
+        - name: DB_HOST
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.database.existingSecret }}
+              key: host
+        - name: DB_PORT
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.database.existingSecret }}
+              key: port
+        {{- end }}
+      containers:
+      - name: migrate
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command:
+        - olake-tui
+        - --migrate-only
+        - --run-mode
+        - "{{ .Values.runMode }}"
+        - --project-id
+        - "{{ .Values.projectId }}"
+        - --temporal-host
+        - "{{ .Values.temporalHost }}"
+        {{- if .Values.encryptionKey }}
+        - --encryption-key
+        - "$(OLAKE_SECRET_KEY)"
+        {{- end }}
+        env:
+        # -- Database URL
+        {{- if .Values.database.existingSecret }}
+        - name: OLAKE_DB_URL
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.database.existingSecret }}
+              key: {{ .Values.database.secretKey }}
+        {{- else }}
+        - name: OLAKE_DB_URL
+          value: "{{ include "olake-tui.dbURL" . }}"
+        {{- end }}
+        # -- Admin credentials
+        {{- if .Values.adminUser.existingSecret }}
+        - name: OLAKE_ADMIN_USER
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.adminUser.existingSecret }}
+              key: {{ .Values.adminUser.secretKeys.username }}
+        - name: OLAKE_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.adminUser.existingSecret }}
+              key: {{ .Values.adminUser.secretKeys.password }}
+        {{- else }}
+        - name: OLAKE_ADMIN_USER
+          value: "{{ .Values.adminUser.username }}"
+        - name: OLAKE_ADMIN_PASSWORD
+          value: "{{ .Values.adminUser.password }}"
+        {{- end }}
+        # -- Encryption key
+        {{- if .Values.encryptionKey }}
+        - name: OLAKE_SECRET_KEY
+          value: "{{ .Values.encryptionKey }}"
+        {{- end }}
+        resources:
+          {{- toYaml .Values.migrate.resources | nindent 10 }}

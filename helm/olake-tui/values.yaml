@@ -1,0 +1,73 @@
+# OLake TUI Helm Values
+#
+# This chart deploys an init Job that bootstraps the OLake database schema
+# and seeds an admin user — replacing the BFF server's migration + signup-init.
+#
+# Use alongside the official olake-helm chart with olakeUI disabled:
+#
+#   # values-tui-override.yaml (for the official olake chart)
+#   olakeUI:
+#     replicaCount: 0
+
+# -- olake-tui Docker image
+image:
+  repository: teamPaprika/olake-tui
+  tag: latest
+  pullPolicy: Always
+
+# -- Database connection
+# If using the official olake-helm chart's internal PostgreSQL, these defaults work.
+# For external PostgreSQL, override accordingly.
+database:
+  # -- Use an existing Kubernetes secret for DB credentials
+  # Secret must contain keys: url (full postgres connection string)
+  existingSecret: ""
+  secretKey: "url"
+
+  # -- Direct connection properties (used if existingSecret is not set)
+  host: "olake-postgresql"
+  port: 5432
+  user: "temporal"
+  password: "temporal"
+  database: "temporal"
+  sslMode: "disable"
+
+# -- OLake run mode (controls table name prefix: olake-{mode}-*)
+runMode: "dev"
+
+# -- AES encryption key for connector configs
+# Must match the key used by OLake workers.
+# Leave empty to disable encryption.
+encryptionKey: ""
+
+# -- Admin user to seed on first run
+adminUser:
+  username: "admin"
+  password: "password"
+  # -- Use existing secret for admin credentials
+  existingSecret: ""
+  secretKeys:
+    username: "username"
+    password: "password"
+
+# -- Temporal host (for schema validation only — migration doesn't need Temporal)
+temporalHost: "olake-temporal:7233"
+
+# -- Project ID
+projectId: "123"
+
+# -- Job configuration
+migrate:
+  # -- Additional annotations for the migrate job
+  annotations: {}
+
+  # -- Resource limits
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "100m"
+
+  # -- Pod scheduling
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}

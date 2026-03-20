@@ -1,0 +1,14 @@
+apiVersion: v2
+name: olake-tui
+description: OLake TUI — Terminal UI for OLake data pipelines (replaces BFF + Web UI)
+type: application
+version: 0.1.0
+appVersion: "0.2.0"
+keywords:
+  - olake
+  - tui
+  - data-pipeline
+  - etl
+home: https://github.com/teamPaprika/olake-tui
+sources:
+  - https://github.com/teamPaprika/olake-tui

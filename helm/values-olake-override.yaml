@@ -1,0 +1,19 @@
+# Override values for the official datazip-inc/olake-helm chart
+# when using olake-tui instead of the web UI.
+#
+# Usage:
+#   helm repo add datazip https://datazip-inc.github.io/olake-helm
+#   helm install olake datazip/olake -f values-olake-override.yaml
+#   helm install olake-tui ./helm/olake-tui
+#
+# This disables the BFF web server and signup init job,
+# since olake-tui handles migration and user seeding directly.
+
+# Disable the BFF web UI server
+olakeUI:
+  replicaCount: 0
+
+# Worker doesn't need callback URL (olake-tui reads Temporal directly)
+olakeWorker:
+  env:
+    OLAKE_CALLBACK_URL: ""
