@@ -28,7 +28,7 @@ theme = "hextra"
 
 [[menu.main]]
   name = "Docs"
-  url = "/olake-tui/docs/"
+  url = "/docs/"
   weight = 5
 
 [[menu.main]]
