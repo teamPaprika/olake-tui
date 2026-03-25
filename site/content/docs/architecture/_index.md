@@ -3,7 +3,6 @@ title: "Architecture"
 weight: 4
 ---
 
-# Architecture
 
 How olake-tui works under the hood.
 

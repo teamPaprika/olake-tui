@@ -3,7 +3,6 @@ title: "Changelog"
 weight: 2
 ---
 
-# Changelog
 
 All notable changes to olake-tui are documented here.
 

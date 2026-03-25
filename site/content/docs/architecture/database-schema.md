@@ -3,7 +3,6 @@ title: "Database Schema"
 weight: 4
 ---
 
-# Database Schema
 
 olake-tui stores all metadata in PostgreSQL. Running with `--migrate` creates the required tables automatically.
 

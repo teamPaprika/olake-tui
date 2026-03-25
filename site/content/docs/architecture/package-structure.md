@@ -3,7 +3,6 @@ title: "Package Structure"
 weight: 2
 ---
 
-# Package Structure
 
 olake-tui follows standard Go project layout conventions with a clear separation between entry point, business logic, and UI components.
 

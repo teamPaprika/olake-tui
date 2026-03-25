@@ -3,7 +3,6 @@ title: "Introduction"
 weight: 1
 ---
 
-# What is olake-tui?
 
 **olake-tui** is a terminal user interface for [OLake](https://olake.io/docs/) — the open-source data pipeline platform. It lets you manage sources, destinations, and sync jobs entirely from the command line, without a web browser or BFF server.
 

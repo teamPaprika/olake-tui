@@ -355,7 +355,6 @@ Used when reading files (CSV, JSON, Parquet) from S3 as the source.
 **Fix:** Remember that connection tests execute on the **OLake Temporal worker**, not on your local machine. The worker must have network access to the source database.
 
 ```bash
-# Test from the worker container
 docker compose exec olake-worker nc -z db.example.com 5432
 ```
 

@@ -3,7 +3,6 @@ title: "Adding Connectors"
 weight: 3
 ---
 
-# Adding Connectors
 
 This guide explains how to add a new source or destination connector to olake-tui. All connector-specific UI logic lives in `internal/ui/connector_forms/`.
 

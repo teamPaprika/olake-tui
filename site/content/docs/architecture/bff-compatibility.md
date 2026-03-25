@@ -3,7 +3,6 @@ title: "BFF Compatibility"
 weight: 3
 ---
 
-# BFF Compatibility
 
 olake-tui is designed to be **fully cross-compatible** with the existing OLake web UI and its BFF (Backend-For-Frontend) server. Data created in one interface works seamlessly in the other.
 

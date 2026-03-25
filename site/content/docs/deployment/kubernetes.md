@@ -3,7 +3,6 @@ title: "Kubernetes (Helm)"
 weight: 2
 ---
 
-# Kubernetes Deployment
 
 For production workloads, deploy OLake infrastructure using the official
 **olake-helm** chart, then layer on `olake-tui` with its own Helm chart.

@@ -3,7 +3,6 @@ title: "Deployment"
 weight: 3
 ---
 
-# Deployment
 
 Deploy olake-tui in any environment — from local Docker to production Kubernetes.
 

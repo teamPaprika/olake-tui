@@ -3,7 +3,6 @@ title: "System Overview"
 weight: 1
 ---
 
-# System Overview
 
 olake-tui is a terminal-based management interface for [OLake](https://olake.io) that connects **directly** to PostgreSQL and Temporal — no HTTP API layer in between.
 

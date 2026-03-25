@@ -3,7 +3,6 @@ title: "Contributing"
 weight: 1
 ---
 
-# Contributing
 
 This guide covers how to set up your development environment, follow code conventions, and submit changes.
 

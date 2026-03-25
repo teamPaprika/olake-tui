@@ -368,7 +368,6 @@ For **Glue catalog**, you also need:
 
 **Fix:**
 ```bash
-# Verify the bucket exists and you can access it
 aws s3 ls s3://my-data-lake/ --region us-east-1
 ```
 

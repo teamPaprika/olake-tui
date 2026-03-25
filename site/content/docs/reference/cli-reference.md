@@ -3,7 +3,6 @@ title: "CLI Reference"
 weight: 1
 ---
 
-# olake-tui
 
 Terminal UI for managing OLake sources, destinations, jobs, and streams.
 

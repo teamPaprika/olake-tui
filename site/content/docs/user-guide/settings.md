@@ -214,7 +214,6 @@ The red `●` dot next to a category means it has new releases you haven't seen.
 By default, OLake TUI checks the official GitHub releases. For internal builds, private mirrors, or air-gapped environments, override the release URL:
 
 ```bash
-# Via command-line flag
 olake-tui --release-url "https://internal.example.com/releases/latest.json"
 
 # Via environment variable

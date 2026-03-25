@@ -142,7 +142,6 @@ VALUES ('newuser', '$2a$10$YOUR_BCRYPT_HASH_HERE', 'newuser@example.com', NOW(),
 To generate a bcrypt hash, use any of these:
 
 ```bash
-# Python
 python3 -c "import bcrypt; print(bcrypt.hashpw(b'mypassword', bcrypt.gensalt(10)).decode())"
 
 # Node.js

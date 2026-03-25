@@ -3,7 +3,6 @@ title: "Development"
 weight: 5
 ---
 
-# Development
 
 Contribute to olake-tui or extend it for your needs.
 

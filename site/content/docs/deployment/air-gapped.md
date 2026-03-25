@@ -3,7 +3,6 @@ title: "Air-Gapped Environments"
 weight: 3
 ---
 
-# Air-Gapped / Offline Deployment
 
 Some environments have no outbound internet access — no Docker Hub, no GitHub
 Releases, no PyPI. This page covers the adjustments needed to deploy `olake-tui`

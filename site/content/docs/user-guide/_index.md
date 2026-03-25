@@ -3,7 +3,6 @@ title: "User Guide"
 weight: 2
 ---
 
-# User Guide
 
 Learn how to use every feature of olake-tui.
 

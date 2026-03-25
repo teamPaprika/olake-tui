@@ -3,7 +3,6 @@ title: "Standalone (Docker Compose)"
 weight: 1
 ---
 
-# Standalone Deployment
 
 The quickest way to run OLake with `olake-tui` is using the Docker Compose file
 shipped at the repository root. It brings up all required infrastructure — no BFF

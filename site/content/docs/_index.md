@@ -3,7 +3,6 @@ title: "olake-tui Documentation"
 weight: 1
 ---
 
-# olake-tui Documentation
 
 **olake-tui** is a terminal UI for [OLake](https://olake.io) — manage data pipelines without leaving the command line. It connects directly to PostgreSQL and Temporal, replacing the BFF web server entirely.
 

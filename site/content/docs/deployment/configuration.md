@@ -3,7 +3,6 @@ title: "Configuration Reference"
 weight: 4
 ---
 
-# Configuration Reference
 
 `olake-tui` is configured via CLI flags or environment variables. Flags take
 precedence over environment variables.

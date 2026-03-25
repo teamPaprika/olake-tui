@@ -36,7 +36,6 @@ postgres://<user>:<password>@<host>:<port>/<database>?sslmode=<mode>
 
 **Valid examples:**
 ```bash
-# Local development (no SSL)
 DATABASE_URL="postgres://olake:mysecret@localhost:5432/olake?sslmode=disable"
 
 # Remote server with SSL

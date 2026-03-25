@@ -3,7 +3,6 @@ title: "Getting Started"
 weight: 1
 ---
 
-# Getting Started
 
 Get olake-tui up and running in minutes.
 

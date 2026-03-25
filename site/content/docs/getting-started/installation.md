@@ -3,7 +3,6 @@ title: "Installation"
 weight: 3
 ---
 
-# Installation
 
 olake-tui is a single Go binary with no runtime dependencies. You can build from source, pull the Docker image, or install directly with `go install`. This page covers every method, plus how to connect to local, remote, and Kubernetes-hosted OLake infrastructure.
 

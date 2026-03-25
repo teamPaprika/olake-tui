@@ -3,7 +3,6 @@ title: "Quick Start"
 weight: 2
 ---
 
-# Quick Start
 
 This guide walks you through setting up olake-tui from scratch and running your first data sync. By the end, you'll have a PostgreSQL source syncing to an S3/Parquet destination — all managed from your terminal.
 

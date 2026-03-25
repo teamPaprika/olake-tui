@@ -3,7 +3,6 @@ title: "Testing"
 weight: 2
 ---
 
-# Testing
 
 olake-tui has two test layers: **unit tests** using `MockService` and **end-to-end tests** against real PostgreSQL and Temporal instances.
 
